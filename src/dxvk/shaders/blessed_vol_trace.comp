@@ -1,0 +1,213 @@
+// blessed: BLESSED_VOLUMETRICS=rt pass 1/2 -- low-res sun in-scatter march with ray-traced visibility and temporal accumulation
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// blessed: global sampler heap, fixed set/binding convention (see
+// dxvk_mipgen.comp, DxvkPipelineLayoutFlag::UsesSamplerHeap)
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+// pass 138's own depth (full res)
+layout(set = 1, binding = 0)
+uniform texture2D s_depth;
+
+// last dispatch's accumulation (low res), sampled bilinear at the
+// reprojected uv
+layout(set = 1, binding = 1)
+uniform texture2D s_history;
+
+// this dispatch's accumulation (low res): x = in-scatter (unscaled),
+// yzw = the march's end point, camera-relative, / 64. Next dispatch's history.
+layout(set = 1, binding = 2, rgba16f)
+uniform image2D s_accumOut;
+
+// blessed: matches BlessedVolConstants in blessed_volumetrics.cpp byte for byte
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedVolConstants {
+  mat4     invViewProj;     // CameraViewProjInverse (row-major bytes: use v * mat)
+  mat4     prevViewProj;    // the history's view-projection, same convention
+  vec3     camDelta;        // tlas-frame shift
+  vec3     sunDir;          // unit, toward the sun, world space
+  vec3     reprojDelta;     // this camera - the history's camera
+  float    farDepthValue;
+  float    phaseG;
+  float    density;
+  float    heightFalloff;
+  float    heightBase;
+  float    heightFloor;
+  float    range;
+  float    sunRayLength;
+  float    historyWeight;
+  float    rejectRel;
+  uint     steps;
+  uint     frameIndex;
+  uint     historyValid;
+  // blessed: point-light hook, reserved. lightCount is 0 until the
+  // point-lights seat lands a light list; see PointLightInScatter below.
+  uint64_t lightsAddress;
+  uint     lightCount;
+};
+
+layout(push_constant, scalar) uniform BlessedVolPush {
+  uint64_t constantsAddress;
+  uint64_t tlasAddress;
+  uint     fullWidth;
+  uint     fullHeight;
+  uint     lowWidth;
+  uint     lowHeight;
+  uint     divisor;
+  uint     samplerIndex;
+  uint     tlasValid;
+  uint     debugMode;       // 0 off, 1 dist, 2 vis, 3 raw, 4 hist, 5 density
+  float    outScale;        // used by the upsample pass only
+  float    maxOut;          // blessed: vol-2, soft shoulder (upsample), 0 = off
+  uint64_t statsAddress;    // blessed: vol-2, per-group (ours, vanilla) sums or 0
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float POS_TO_ACCUM = 1.0 / 64.0;
+const float ACCUM_TO_POS = 64.0;
+const float PI = 3.14159265358979;
+
+float Hash(uvec2 p, uint salt) {
+  uint h = p.x * 374761393u + p.y * 668265263u + salt * 2654435761u;
+  h = (h ^ (h >> 13u)) * 1274126177u;
+  h ^= h >> 16u;
+  return float(h) * (1.0 / 4294967296.0);
+}
+
+// blessed: henyey-greenstein, scaled by 4 pi so an isotropic medium reads 1
+float PhaseHG(float cosTheta, float g) {
+  float g2 = g * g;
+  float denom = max(1.0 + g2 - 2.0 * g * cosTheta, 1.0e-4);
+  return (1.0 - g2) / (denom * sqrt(denom));
+}
+
+// blessed: height fog. h is camera-relative height (skyrim z is up):
+// full density below heightBase, thinning with heightFalloff above it,
+// never below heightFloor of full.
+float Density(BlessedVolConstants k, float h) {
+  float above = max(h - k.heightBase, 0.0);
+  return k.density * mix(k.heightFloor, 1.0, exp(-above * k.heightFalloff));
+}
+
+float SunVisibility(vec3 camRelPos, vec3 camDelta, vec3 sunDir, float tMax) {
+  rayQueryEXT rq;
+  rayQueryInitializeEXT(rq, accelerationStructureEXT(pc.tlasAddress),
+    gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+    camRelPos + camDelta, 1.0, sunDir, tMax);
+  while (rayQueryProceedEXT(rq)) { }
+  return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
+
+// blessed: point-light hook. Returns 0 until lights exist. The scalar
+// target pass 167 composites is tinted by the sun's colour, so coloured
+// point-light glow will need its own rgb target and composite; this is
+// where its per-step term would be evaluated.
+float PointLightInScatter(BlessedVolConstants k, vec3 camRelPos) {
+  return 0.0;
+}
+
+void main() {
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(pc.lowWidth) || coord.y >= int(pc.lowHeight))
+    return;
+
+  BlessedVolConstants k = BlessedVolConstants(pc.constantsAddress);
+
+  // the full-res texel at the centre of this low-res cell
+  ivec2 full = min(coord * int(pc.divisor) + int(pc.divisor / 2u),
+    ivec2(int(pc.fullWidth) - 1, int(pc.fullHeight) - 1));
+  float depth = texelFetch(sampler2D(s_depth, s_samplers[pc.samplerIndex]), full, 0).r;
+  bool sky = depth == k.farDepthValue;
+
+  // d3d viewport conventions: ndc.x = 2u-1, ndc.y = 1-2v
+  vec2 uv = (vec2(full) + 0.5) / vec2(pc.fullWidth, pc.fullHeight);
+  vec4 endH = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, sky ? 0.5 : depth, 1.0) * k.invViewProj;
+  vec3 endPos = endH.xyz / endH.w;
+  float endDist = length(endPos);
+  vec3 dir = endPos / max(endDist, 1.0e-6);
+  float tEnd = sky ? k.range : min(endDist, k.range);
+  endPos = dir * tEnd;
+
+  vec4 posOut = vec4(0.0, endPos * POS_TO_ACCUM);
+
+  if (pc.debugMode == 1u) {
+    // dist: 1.0 per 2000 units along the view ray (sky reads range / 2000)
+    imageStore(s_accumOut, coord, posOut + vec4(tEnd / 2000.0, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  if (pc.debugMode == 2u) {
+    // vis: sun visibility at the surface itself; should match the traced
+    // shadow mask (sky reads 1)
+    float v = 1.0;
+    if (!sky && pc.tlasValid != 0u)
+      v = SunVisibility(endPos - dir * (0.002 * endDist + 1.0), k.camDelta, k.sunDir, k.sunRayLength);
+    imageStore(s_accumOut, coord, posOut + vec4(v, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  if (pc.debugMode == 5u) {
+    // density: fog density at the end point relative to BLESSED_VOL_DENSITY
+    imageStore(s_accumOut, coord, posOut + vec4(Density(k, endPos.z) / max(k.density, 1.0e-12), 0.0, 0.0, 0.0));
+    return;
+  }
+
+  // the march: jittered stratified steps from the camera to the end point
+  uint steps = max(k.steps, 1u);
+  float dt = tEnd / float(steps);
+  float jitter = Hash(uvec2(coord), k.frameIndex);
+  float phase = PhaseHG(dot(dir, k.sunDir), k.phaseG);
+
+  float transmittance = 1.0;
+  float inScatter = 0.0;
+
+  for (uint i = 0u; i < steps; i++) {
+    float t = (float(i) + jitter) * dt;
+    vec3 p = dir * t;
+    float sigma = Density(k, p.z);
+
+    float vis = pc.tlasValid != 0u ? SunVisibility(p, k.camDelta, k.sunDir, k.sunRayLength) : 1.0;
+    float light = vis * phase;
+    if (k.lightCount != 0u)
+      light += PointLightInScatter(k, p);
+
+    // single scattering, albedo 1: in-scatter this step, then attenuate
+    float stepT = exp(-sigma * dt);
+    inScatter += transmittance * light * (1.0 - stepT);
+    transmittance *= stepT;
+  }
+
+  // temporal: reproject the end point with the history's own camera
+  vec3 posPrev = endPos + k.reprojDelta;
+  float distPrev = length(posPrev);
+  vec4 clipPrev = vec4(posPrev, 1.0) * k.prevViewProj;
+  bool offscreen = clipPrev.w <= 0.0;
+  vec2 uvPrev = vec2(0.0);
+  if (!offscreen) {
+    vec2 ndcPrev = clipPrev.xy / clipPrev.w;
+    uvPrev = vec2(ndcPrev.x * 0.5 + 0.5, 0.5 - ndcPrev.y * 0.5);
+    offscreen = any(lessThan(uvPrev, vec2(0.0))) || any(greaterThan(uvPrev, vec2(1.0)));
+  }
+
+  vec4 hist = texture(sampler2D(s_history, s_samplers[pc.samplerIndex]), uvPrev);
+  vec3 histPos = hist.yzw * ACCUM_TO_POS;
+  bool noHistory = offscreen || k.historyValid == 0u || dot(histPos, histPos) == 0.0;
+  bool reject = noHistory || length(histPos - posPrev) > k.rejectRel * max(distPrev, 1.0);
+
+  if (pc.debugMode == 4u) {
+    imageStore(s_accumOut, coord, posOut + vec4(reject ? 1.0 : 0.0, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  float w = (reject || pc.debugMode == 3u) ? 0.0 : k.historyWeight;
+  float blended = mix(inScatter, hist.x, w);
+
+  imageStore(s_accumOut, coord, posOut + vec4(blended, 0.0, 0.0, 0.0));
+}

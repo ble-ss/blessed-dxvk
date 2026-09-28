@@ -1,3 +1,22 @@
+# blessed-dxvk
+
+This is a fork of DXVK 3.1.1, tuned for one game: Skyrim Special Edition on Windows. With the benchmark harness and SKSE plugin from **[blessed-skyrim](https://github.com/ble-ss/blessed-skyrim)**, it runs Skyrim faster than native DX11 at ultra 1080p: +10.97% in Whiterun and +4.37% flying the plains (paired campaigns, 5 of 5 runs), and 1.52x stock DXVK in Whiterun.
+
+The work is on the `blessed` branch, as changes on top of the 3.1.1 release:
+
+- a constant-buffer ring for Skyrim's ~13,000 `Map(DISCARD)` calls per frame, and a VRAM mirror of it on the transfer queue
+- a threaded D3D11 front end: calls are recorded on the game thread and replayed on a second thread
+- dynamic vertex and index buffers in VRAM
+- zero-copy present, and implicit flushes deferred to the end of the render pass
+- exact shader replacements by content hash (the volumetric generate at 8x8 thread groups, two blurs)
+- perf-max's motion-gated temporal reuse: volumetric light and water reflections at half rate
+
+The Skyrim-specific switches are `dxvk.conf` keys (`d3d11.blessedCbRing`, `d3d11.blessedThreadedFrontEnd`, `d3d11.blessedCbMirror`, `d3d11.blessedVbRebar`) and `BLESSED_*` environment variables. The settings we measured with, the numbers and the full story are in blessed-skyrim.
+
+This fork builds on Windows with llvm-mingw (`tools/build-dxvk-mingw.cmd` in blessed-skyrim). It does not build with GCC mingw or for Linux yet. Everything below is upstream DXVK's own readme. The license is DXVK's zlib license, unchanged.
+
+---
+
 # DXVK
 
 A Vulkan-based translation layer for Direct3D 8/9/10/11 which allows running 3D applications on Linux using Wine.

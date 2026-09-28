@@ -19,6 +19,8 @@
 #include "dxvk_sparse.h"
 #include "dxvk_stats.h"
 
+#include "blessed/blessed_gpu_gaps.h" // blessed: gpu-gaps
+
 namespace dxvk {
 
   class DxvkCheckpointBuffer;
@@ -50,6 +52,8 @@ namespace dxvk {
   struct DxvkTimelineSemaphores {
     VkSemaphore graphics = VK_NULL_HANDLE;
     VkSemaphore transfer = VK_NULL_HANDLE;
+    // blessed: async-compute -- null unless the device has the async queue
+    VkSemaphore blessedCompute = VK_NULL_HANDLE;
   };
 
 
@@ -59,6 +63,7 @@ namespace dxvk {
   struct DxvkTimelineSemaphoreValues {
     uint64_t graphics = 0u;
     uint64_t transfer = 0u;
+    uint64_t blessedCompute = 0u; // blessed: async-compute
   };
 
 
@@ -169,6 +174,8 @@ namespace dxvk {
     bool                sparseBind  = false;
     bool                reserved    = false;
     uint32_t            sparseCmd   = 0;
+    // blessed: async-compute -- this chunk waits for the latest async kick
+    bool                blessedWaitCompute = false;
 
     std::array<VkCommandBuffer, uint32_t(DxvkCmdBuffer::Count)> cmdBuffers = { };
   };
@@ -340,6 +347,16 @@ namespace dxvk {
         m_objectTracker.track<DxvkObjectRef<DxvkSampler>>(std::move(sampler));
     }
 
+    // blessed: perlayer -- any tracked use of an image counts as a use of
+    // all its layers; DxvkContext narrows it for render target binds.
+    template<typename T>
+    void blessedTrackLayers(T* object) {
+      if constexpr (std::is_same_v<std::remove_cv_t<T>, DxvkImage>) {
+        if (unlikely(g_blessedLayerTracking))
+          object->blessedTouchAllLayers(m_trackingId);
+      }
+    }
+
     /**
      * \brief Tracks a resource with access mode
      *
@@ -351,18 +368,21 @@ namespace dxvk {
      */
     template<typename T>
     void track(Rc<T>&& object, DxvkAccess access) {
+      blessedTrackLayers(object.ptr());
       if (object->trackId(m_trackingId, access))
         m_objectTracker.track<DxvkResourceRef>(std::move(object), access);
     }
 
     template<typename T>
     void track(const Rc<T>& object, DxvkAccess access) {
+      blessedTrackLayers(object.ptr());
       if (object->trackId(m_trackingId, access))
         m_objectTracker.track<DxvkResourceRef>(object.ptr(), access);
     }
 
     template<typename T>
     void track(T* object, DxvkAccess access) {
+      blessedTrackLayers(object);
       if (object->trackId(m_trackingId, access))
         m_objectTracker.track<DxvkResourceRef>(object, access);
     }
@@ -1020,7 +1040,28 @@ namespace dxvk {
       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
       m_statCounters.addCtr(DxvkStatCounter::CmdBarrierCount, 1);
 
+      // blessed: vol-async-3 -- a compute-family kick takes compute stages only
+      if (unlikely(m_blessedVolCompute) && cmdBuffer == DxvkCmdBuffer::ExecBuffer) {
+        blessedComputeBarrier(dependencyInfo);
+        return;
+      }
+
       m_vkd->vkCmdPipelineBarrier2(getCmdBuffer(cmdBuffer), dependencyInfo);
+    }
+
+
+    // blessed: thin wrapper so callers outside this class (blessed_rt.cpp)
+    // can record an acceleration structure build without needing the raw
+    // VkCommandBuffer handle, which getCmdBuffer keeps private.
+    void cmdBuildAccelerationStructures(
+            DxvkCmdBuffer                                   cmdBuffer,
+            uint32_t                                        infoCount,
+      const VkAccelerationStructureBuildGeometryInfoKHR*    infos,
+      const VkAccelerationStructureBuildRangeInfoKHR* const* rangeInfos) {
+      m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+
+      m_vkd->vkCmdBuildAccelerationStructuresKHR(
+        getCmdBuffer(cmdBuffer), infoCount, infos, rangeInfos);
     }
 
 
@@ -1091,6 +1132,17 @@ namespace dxvk {
     void cmdSetDepthClipState(
             VkBool32                depthClipEnable) {
       m_vkd->vkCmdSetDepthClipEnableEXT(getCmdBuffer(), depthClipEnable);
+    }
+
+
+    // blessed: vrs -- 1x1 pipeline rate, attachment rate used (REPLACE)
+    // or ignored (KEEP). See blessed/blessed_vrs.cpp.
+    void cmdSetFragmentShadingRate(
+            VkFragmentShadingRateCombinerOpKHR attachmentOp) {
+      VkExtent2D fragmentSize = { 1u, 1u };
+      VkFragmentShadingRateCombinerOpKHR ops[2] = {
+        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR, attachmentOp };
+      m_vkd->vkCmdSetFragmentShadingRateKHR(getCmdBuffer(), &fragmentSize, ops);
     }
 
 
@@ -1352,6 +1404,40 @@ namespace dxvk {
       m_descriptorHeapInvalidated = true;
     }
 
+    /**
+     * \brief Starts recording work for the async compute queue
+     *
+     * blessed: async-compute. Closes the current graphics chunk, then swaps a
+     * compute-family command buffer into the \c ExecBuffer slot, so pass
+     * code keeps recording into \c DxvkCmdBuffer::ExecBuffer. Until
+     * \ref blessedAsyncEnd: compute-legal commands and barrier stages only,
+     * nothing into the init or sdma buffers, no render pass, no context
+     * helper that records barriers of its own. Only valid when the device
+     * has the async queue. See src/dxvk/blessed/blessed_async.h.
+     */
+    void blessedAsyncBegin(bool volCompute = false);
+
+    /**
+     * \brief Ends async recording and records the kick
+     *
+     * blessed: async-compute. The recorded buffer is submitted to the async
+     * queue right before the next graphics chunk, waiting for every graphics
+     * chunk submitted before it.
+     */
+    void blessedAsyncEnd();
+
+    /**
+     * \brief Makes the following graphics work wait for all kicks so far
+     *
+     * blessed: async-compute. Closes the current graphics chunk; the next
+     * one waits for the async queue's latest value at submit time.
+     */
+    void blessedAsyncWait();
+
+    bool blessedAsyncRecording() const {
+      return m_blessedGfxExec != VK_NULL_HANDLE;
+    }
+
   private:
     
     DxvkDevice*               m_device;
@@ -1393,6 +1479,38 @@ namespace dxvk {
     std::vector<DxvkGraphicsPipeline*> m_pipelines;
 
     bool m_descriptorHeapInvalidated = false;
+
+    // blessed: async-compute -- see blessedAsyncBegin
+    struct BlessedAsyncKick {
+      VkCommandBuffer cmdBuffer   = VK_NULL_HANDLE;
+      uint32_t        beforeChunk = 0u;
+      bool            volCompute  = false; // blessed: vol-async-3
+    };
+
+    Rc<DxvkCommandPool>                  m_blessedComputePool;
+    // blessed: vol-async-3 -- BLESSED_VOL_ASYNC=2's chain kick, see blessedAsyncBegin
+    Rc<DxvkCommandPool>                  m_blessedVolComputePool;
+    bool                                 m_blessedVolCompute      = false;
+
+    void blessedComputeBarrier(const VkDependencyInfo* dependencyInfo);
+    VkCommandBuffer                      m_blessedGfxExec         = VK_NULL_HANDLE;
+    bool                                 m_blessedGfxExecCommands = false;
+    VkDeviceAddress                      m_blessedHeapBase        = 0u;
+    small_vector<BlessedAsyncKick, 4>    m_blessedKicks;
+    DxvkCommandSubmission                m_blessedSubmission;
+
+    VkResult blessedSubmitKick(
+      const BlessedAsyncKick&             kick,
+      const DxvkTimelineSemaphores&       semaphores,
+            DxvkTimelineSemaphoreValues&  timelines,
+            uint64_t                      trackedId);
+
+    // blessed: gpu-gaps -- per command buffer timestamps (blessed_gpu_gaps.cpp)
+    small_vector<BlessedGapMark, 16>     m_blessedGapMarks;
+
+    void blessedGapMark(VkCommandBuffer cmdBuffer, DxvkCmdBuffer type, bool end);
+
+    void blessedGapSubmit();
 
     std::array<int32_t, uint32_t(DxvkCmdBuffer::Count)> m_checkpointIds = {};
 

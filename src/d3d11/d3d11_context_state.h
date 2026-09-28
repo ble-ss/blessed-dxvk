@@ -205,6 +205,14 @@ namespace dxvk {
     UINT  minUav         = D3D11_1_UAV_SLOT_COUNT;
     UINT  maxUav         = 0u;
 
+    // blessed: hook-cpu -- bumped whenever rtvs, dsv or dsState actually
+    // change (SetRenderTargetsAndUnorderedAccessViews's needsUpdate path,
+    // OMSetDepthStencilState, and reset() below). Lets a per-draw pass
+    // classification (BlessedSceneCapture's depth-only rule, BlessedGi's
+    // main-lit-pass check) cache its result until the next real OM bind
+    // instead of recomputing it every draw.
+    uint64_t blessedOmGeneration = 0u;
+
     void reset() {
       for (uint32_t i = minUav; i < maxUav; i++)
         uavs[i] = nullptr;
@@ -227,6 +235,8 @@ namespace dxvk {
       maxRtv = 0u;
       minUav = D3D11_1_UAV_SLOT_COUNT;
       maxUav = 0u;
+
+      blessedOmGeneration++; // blessed: hook-cpu -- rtvs/dsv/dsState just cleared
     }
   };
   

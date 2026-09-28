@@ -7,6 +7,8 @@
 #include "dxvk_sparse.h"
 #include "dxvk_util.h"
 
+#include "blessed/blessed_layer_tracking.h" // blessed: perlayer
+
 namespace dxvk {
 
   /**
@@ -77,6 +79,11 @@ namespace dxvk {
 
     // Debug name
     const char* debugName = nullptr;
+
+    // blessed: async-compute -- a pass-owned image the async compute queue
+    // reads or writes: created concurrent across the device's queue families
+    // (only when that queue is in another family) and never relocated.
+    bool blessedConcurrent = false;
   };
   
   
@@ -575,6 +582,36 @@ namespace dxvk {
       return m_unifiedLayoutEnabled;
     }
 
+    // blessed: perlayer -- which array layers the command list with the
+    // given tracking ID has touched. Every DxvkCommandList::track() of an
+    // image marks all layers; only the render target path narrows the
+    // mask to the attachment's layers (see DxvkContext::acquireRenderTargets).
+    bool blessedLayerTrackable() const {
+      return m_info.type != VK_IMAGE_TYPE_3D
+          && m_info.numLayers > 1u && m_info.numLayers <= 64u
+          && m_info.sampleCount == VK_SAMPLE_COUNT_1_BIT
+          && !(m_info.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+          && !m_shared && m_blessedSharing.familyCount == 1u;
+    }
+
+    void blessedTouchAllLayers(uint64_t trackingId) {
+      m_blessedLayers.trackingId = trackingId;
+      m_blessedLayers.layerMask = BlessedAllLayers;
+    }
+
+    uint64_t blessedTouchedLayers(uint64_t trackingId) const {
+      if (!isTracked(trackingId, DxvkAccess::Write))
+        return 0u;
+
+      return m_blessedLayers.trackingId == trackingId
+        ? m_blessedLayers.layerMask : BlessedAllLayers;
+    }
+
+    void blessedSetTouchedLayers(uint64_t trackingId, uint64_t layerMask) {
+      m_blessedLayers.trackingId = trackingId;
+      m_blessedLayers.layerMask = layerMask;
+    }
+
     /**
      * \brief Checks whether a subresource is entirely covered
      * 
@@ -873,6 +910,13 @@ namespace dxvk {
       DxvkImageView, DxvkHash, DxvkEq> m_views;
 
     std::string                 m_debugName;
+
+    // blessed: async-compute -- see DxvkImageCreateInfo::blessedConcurrent;
+    // familyCount stays 1 (exclusive) for every other image
+    DxvkSharingModeInfo         m_blessedSharing = { };
+
+    // blessed: perlayer
+    DxvkBlessedLayerState       m_blessedLayers = { };
 
     void updateDebugName();
 

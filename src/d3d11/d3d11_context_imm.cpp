@@ -1,3 +1,7 @@
+#include "blessed_autoinstance.h" // blessed: auto-instancing census
+#include "blessed_dump.h" // blessed: frame draw-classification dumper
+#include "blessed_flush_pass_end.h" // blessed: flush-pass-end, BLESSED_FLUSH_AT_PASS_END
+#include "blessed_zero_copy.h" // blessed: zero-copy-present
 #include "d3d11_cmdlist.h"
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
@@ -5,6 +9,9 @@
 #include "d3d11_texture.h"
 
 #include "../util/util_win32_compat.h"
+
+// blessed: render-thread timing probe, see src/util/util_blessed_probe.h
+#include "../util/util_blessed_probe.h"
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
@@ -23,6 +30,8 @@ namespace dxvk {
     m_multithread(this, false, pParent->GetOptions()->enableContextLock),
     m_videoContext(this, Device),
     m_destructionNotifier(this) {
+    m_blessedFlushPassEnd = BlessedFlushPassEnd::Enabled(); // blessed: flush-pass-end
+
     EmitCs([
       cDevice                 = m_device,
       cBarrierControlFlags    = pParent->GetOptionsBarrierControlFlags()
@@ -37,6 +46,15 @@ namespace dxvk {
     SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
     
     ClearState();
+
+    // blessed: cb-ring -- ring chunks are bound as uniform buffers at
+    // their chunk offset, so they keep the device's binding alignment
+    m_blessedCbRing.setAlignment(std::max<VkDeviceSize>(CACHE_LINE_SIZE,
+      Device->properties().core.properties.limits.minUniformBufferOffsetAlignment));
+    // blessed: perf-halfrate -- ring blocks in resizable-bar vram
+    m_blessedCbRing.setDeviceLocal(pParent->GetOptions()->blessedCbRingDeviceLocal);
+    // blessed: cb-mirror -- a vram mirror of each cached ring block
+    m_blessedCbRing.setMirror(pParent->GetOptions()->blessedCbMirror);
   }
   
   
@@ -125,6 +143,8 @@ namespace dxvk {
     if (unlikely(!query->DoBegin()))
       return;
 
+    BlessedAutoInstance::OnBarrier(); // blessed: auto-instancing census, a query splits a segment
+
     EmitCs([cQuery = Com<D3D11Query, false>(query)]
     (DxvkContext* ctx) {
       cQuery->Begin(ctx);
@@ -139,6 +159,8 @@ namespace dxvk {
       return;
     
     auto query = static_cast<D3D11Query*>(pAsync);
+
+    BlessedAutoInstance::OnBarrier(); // blessed: auto-instancing census, a query splits a segment
 
     if (unlikely(!query->DoEnd())) {
       EmitCs([cQuery = Com<D3D11Query, false>(query)]
@@ -229,6 +251,12 @@ namespace dxvk {
           BOOL                RestoreContextState) {
     D3D10DeviceLock lock = LockContext();
 
+    // blessed: zero-copy-present -- a deferred list may touch the back
+    // buffer outside the redirect; end it for this frame (skyrim never
+    // records deferred lists)
+    if (unlikely(BlessedZeroCopy::IsEnabled()))
+      BlessedZeroCopy::OnUnknownAccess(this, "deferred command list");
+
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
 
     // Reset dirty binding tracking before submitting any CS chunks.
@@ -289,11 +317,16 @@ namespace dxvk {
           D3D11_MAP                   MapType,
           UINT                        MapFlags,
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
+    blessed::CallScope<true> blessedProbe_Map(blessed::Call::Map);
     D3D10DeviceLock lock = LockContext();
 
     if (unlikely(!pResource))
       return E_INVALIDARG;
-    
+
+    // blessed: probe dump hook
+    if (unlikely(BlessedDump::IsCapturing()))
+      BlessedDump::RecordMap(pResource, Subresource, MapType);
+
     D3D11_RESOURCE_DIMENSION resourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     pResource->GetType(&resourceDim);
 
@@ -302,6 +335,10 @@ namespace dxvk {
         static_cast<D3D11Buffer*>(pResource),
         MapType, MapFlags, pMappedResource);
     } else {
+      // blessed: zero-copy-present -- a map of the back buffer
+      if (unlikely(BlessedZeroCopy::IsEnabled()))
+        BlessedZeroCopy::OnResourceAccess(this, pResource, "map");
+
       return MapImage(GetCommonTexture(pResource),
         Subresource, MapType, MapFlags, pMappedResource);
     }
@@ -311,6 +348,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11ImmediateContext::Unmap(
           ID3D11Resource*             pResource,
           UINT                        Subresource) {
+    blessed::CallScope<true> blessedProbe_Unmap(blessed::Call::Unmap);
     // Since it is very uncommon for images to be mapped compared
     // to buffers, we count the currently mapped images in order
     // to avoid a virtual method call in the common case.
@@ -331,6 +369,24 @@ namespace dxvk {
           D3D11_MAP                   MapType,
           UINT                        MapFlags,
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
+    // blessed: classify once up front; the RAII scope covers every return
+    // path below and reports into the (map type x bind kind) bucket. Guarded
+    // by active() so the classification itself -- a Desc() read plus two
+    // branches -- costs nothing on the ~13k calls/frame this hits when the
+    // probe isn't sampling this frame (MapScope's own ctor/dtor already gate
+    // the same way; this just keeps its *arguments* from being computed
+    // unconditionally too).
+    blessed::MapType blessedMapType = blessed::MapType::Other;
+    blessed::BindKind blessedBindKind = blessed::BindKind::Other;
+    if (unlikely(blessed::active())) {
+      blessedMapType = MapType == D3D11_MAP_WRITE_DISCARD
+        ? (pResource->BlessedUsesCbRing() ? blessed::MapType::Ring : blessed::MapType::Discard) // blessed: cb-ring
+        : MapType == D3D11_MAP_WRITE_NO_OVERWRITE                          ? blessed::MapType::NoOverwrite
+        :                                                                    blessed::MapType::Other;
+      blessedBindKind = blessed::classifyBindFlags(pResource->Desc()->BindFlags);
+    }
+    blessed::MapScope blessedProbe_MapBuffer(blessedMapType, blessedBindKind);
+
     if (unlikely(!pMappedResource))
       return E_INVALIDARG;
 
@@ -343,10 +399,23 @@ namespace dxvk {
     VkDeviceSize bufferSize = pResource->Desc()->ByteWidth;
 
     if (likely(MapType == D3D11_MAP_WRITE_DISCARD)) {
+      // blessed: cb-ring -- small dynamic cbuffers take a ring chunk and a
+      // batched rename instead (blessed_cb_ring.cpp); false only when the
+      // ring has no free block, and then the upstream path below runs.
+      if (pResource->BlessedUsesCbRing()) {
+        if (likely(BlessedMapCbRing(pResource, pMappedResource)))
+          return S_OK;
+
+        blessedProbe_MapBuffer.setType(blessed::MapType::Discard);
+      }
+
       // Allocate a new backing slice for the buffer and set
       // it as the 'new' mapped slice. This assumes that the
       // only way to invalidate a buffer is by mapping it.
-      auto bufferSlice = pResource->DiscardSlice(&m_allocationCache);
+      Rc<DxvkResourceAllocation> bufferSlice;
+      { blessed::DiscardSliceScope blessedProbe_DiscardSlice;
+        bufferSlice = pResource->DiscardSlice(&m_allocationCache);
+      }
       pMappedResource->pData      = bufferSlice->mapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
@@ -397,7 +466,10 @@ namespace dxvk {
       if (doInvalidatePreserve) {
         auto srcPtr = pResource->GetMapPtr();
 
-        auto dstSlice = pResource->DiscardSlice(nullptr);
+        Rc<DxvkResourceAllocation> dstSlice;
+        { blessed::DiscardSliceScope blessedProbe_DiscardSlice;
+          dstSlice = pResource->DiscardSlice(nullptr);
+        }
         auto dstPtr = dstSlice->mapPtr();
 
         EmitCs([
@@ -875,6 +947,19 @@ namespace dxvk {
     // flush, so no state changes are allowed to happen there.
     SetDrawBuffers(nullptr, nullptr);
 
+    // blessed: flush-pass-end -- PresentImage flushes unconditionally right
+    // after this call, so any deferred flush is caught regardless; clear
+    // the open-pass approximation so next frame's first few implicit hints
+    // (before its first render-target change) aren't deferred needlessly.
+    if (unlikely(m_blessedFlushPassEnd)) {
+      m_blessedRenderPassOpen = false;
+      BlessedFlushPassEnd::OnFrame();
+    }
+
+    // blessed: cb-ring -- the frame fence ring blocks are reused against
+    if (unlikely(m_parent->GetOptions()->blessedCbRing))
+      BlessedEndFrameCbRing();
+
     EmitCs<false>([
       cTracker = std::move(LatencyTracker)
     ] (DxvkContext* ctx) {
@@ -941,6 +1026,11 @@ namespace dxvk {
 
 
   void D3D11ImmediateContext::EmitCsChunk(DxvkCsChunkRef&& chunk) {
+    // blessed: times the whole call, since this is the only place that can
+    // observe the app thread blocking on chunk dispatch (e.g. cs queue lock
+    // contention with the worker thread mid-swap).
+    blessed::EmitBlockScope blessedProbe_EmitCsChunk;
+
     // Flush init commands so that the CS thread
     // can processe them before the first use.
     m_parent->FlushInitCommands();
@@ -1084,8 +1174,45 @@ namespace dxvk {
     uint64_t chunkId = GetCurrentSequenceNumber();
     uint64_t submissionId = m_submissionFence->value();
 
-    if (m_flushTracker.considerFlush(FlushType, chunkId, submissionId, m_estimatedCost))
-      ExecuteFlush(FlushType, nullptr, false);
+    if (!m_flushTracker.considerFlush(FlushType, chunkId, submissionId, m_estimatedCost))
+      return;
+
+    // blessed: flush-pass-end -- a weak hint approved while targets are
+    // bound would end the pass early and reopen it on the next draw.
+    // Skipping notifyFlush leaves it as the tracker's missed type, and
+    // the upstream ConsiderFlush at the next render-target change takes
+    // it, see BlessedDeferFlush.
+    if (unlikely(m_blessedFlushPassEnd) && m_blessedRenderPassOpen
+     && BlessedDeferFlush(FlushType, chunkId, submissionId))
+      return;
+
+    ExecuteFlush(FlushType, nullptr, false);
+  }
+
+
+  bool D3D11ImmediateContext::BlessedDeferFlush(
+          GpuFlushType                FlushType,
+          uint64_t                    ChunkId,
+          uint64_t                    CompletedSubmissionId) {
+    // blessed: flush-pass-end -- only weak hints wait: explicit and
+    // synchronisation flushes have a caller waiting, and strong hints
+    // exist for read-back latency. The tracker's missed type must be weak
+    // too: it is the strongest hint pending (a strong one it refused
+    // earlier for too few chunks may be what just got approved).
+    if (FlushType != GpuFlushType::ImplicitWeakHint
+     || m_flushTracker.getPendingType() != GpuFlushType::ImplicitWeakHint)
+      return false;
+
+    // Bound the command list a deferral can grow and the time the gpu can
+    // starve behind one long pass: past either cap, split the pass.
+    if (ChunkId - m_flushSeqNum >= BlessedFlushPassEnd::MaxChunks()
+     || m_estimatedCost >= GpuCostEstimate::MaxCostPerSubmission) {
+      BlessedFlushPassEnd::OnCapped();
+      return false;
+    }
+
+    BlessedFlushPassEnd::OnDeferred(m_submissionId <= CompletedSubmissionId);
+    return true;
   }
 
 
@@ -1101,6 +1228,12 @@ namespace dxvk {
     // Exit early if there's nothing to do
     if (!GetPendingCsChunks() && !hEvent)
       return;
+
+    if (unlikely(BlessedGpuPasses::IsEnabled())) // blessed: gpu-gaps, flushes by reason
+      BlessedGpuPasses::OnFlush(uint32_t(FlushType));
+
+    if (unlikely(m_blessedFlushPassEnd) && m_blessedRenderPassOpen) // blessed: flush-pass-end, a pass split
+      BlessedFlushPassEnd::OnSplit();
 
     m_hasPendingUnresolvedPass = false;
 
@@ -1188,8 +1321,27 @@ namespace dxvk {
 
 
   void D3D11ImmediateContext::NotifyRenderPassBoundary(bool IsMultisampled) {
+    // blessed: flush-pass-end -- the targets just changed, so the pass is
+    // over: the ConsiderFlush below must not defer. A deferred weak hint
+    // is the tracker's missed type, and considerFlush re-approves it here
+    // (its chunk count only grew, its in-flight count only shrank).
+    if (unlikely(m_blessedFlushPassEnd)) {
+      m_blessedRenderPassOpen = false;
+      BlessedFlushPassEnd::OnBoundary();
+    }
+
     // Doing this makes it less likely to flush during render passes
     ConsiderFlush(GpuFlushType::ImplicitWeakHint);
+
+    // blessed: flush-pass-end -- a pass is open while any target is bound
+    if (unlikely(m_blessedFlushPassEnd)) {
+      bool bound = m_state.om.dsv != nullptr;
+
+      for (uint32_t i = 0; i < m_state.om.maxRtv && !bound; i++)
+        bound = m_state.om.rtvs[i] != nullptr;
+
+      m_blessedRenderPassOpen = bound;
+    }
 
     if (m_device->perfHints().preferRenderPassOps) {
       // Make sure that explicit flushes get ignored until the next resolve
@@ -1240,8 +1392,13 @@ namespace dxvk {
   GpuFlushType D3D11ImmediateContext::GetMaxFlushType(
           D3D11Device*    pParent,
     const Rc<DxvkDevice>& Device) {
+    if (BlessedFlush::Name()) // blessed: gpu-gaps, BLESSED_FLUSH
+      Logger::info(str::format("BlessedFlush: policy ", BlessedFlush::Name()));
+
     if (pParent->GetOptions()->reproducibleCommandStream)
       return GpuFlushType::ExplicitFlush;
+    else if (BlessedFlush::IgnoreWeakHints()) // blessed: gpu-gaps, BLESSED_FLUSH=strong
+      return GpuFlushType::ImplicitStrongHint;
     else if (Device->perfHints().preferRenderPassOps)
       return GpuFlushType::ImplicitStrongHint;
     else

@@ -150,6 +150,12 @@ namespace dxvk {
     if (m_unifiedLayoutEnabled)
       m_info.layout = VK_IMAGE_LAYOUT_GENERAL;
 
+    // blessed: async-compute -- pass-owned image shared with the async queue
+    if (unlikely(createInfo.blessedConcurrent) && device->blessedAsyncNeedsConcurrent()) {
+      m_blessedSharing = device->getSharingMode();
+      m_stableAddress = true;
+    }
+
     // Determine whether the image is shareable before creating the resource
     VkImageCreateInfo imageInfo = getImageCreateInfo(DxvkImageUsageInfo());
     m_shared = canShareImage(device, imageInfo, m_info.sharing);
@@ -589,6 +595,10 @@ namespace dxvk {
     info.usage = m_info.usage | usageInfo.usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.initialLayout = m_info.initialLayout;
+
+    // blessed: async-compute -- concurrent only for blessedConcurrent images
+    if (unlikely(m_blessedSharing.familyCount > 1u))
+      m_blessedSharing.fill(info);
 
     return info;
   }

@@ -301,6 +301,9 @@ namespace dxvk {
     deviceQueues.graphics = getDeviceQueue(vkd, caps, queueMapping.graphics);
     deviceQueues.transfer = getDeviceQueue(vkd, caps, queueMapping.transfer);
     deviceQueues.sparse   = getDeviceQueue(vkd, caps, queueMapping.sparse);
+    deviceQueues.blessedCompute = getDeviceQueue(vkd, caps, queueMapping.blessedCompute); // blessed: async-compute
+    deviceQueues.blessedVolCompute = getDeviceQueue(vkd, caps, queueMapping.blessedVolCompute); // blessed: vol-async-3
+    deviceQueues.blessedPresent = getDeviceQueue(vkd, caps, queueMapping.blessedPresent); // blessed: present-idle
 
     return new DxvkDevice(m_instance, this, vkd, caps, deviceQueues, DxvkQueueCallback());
   }

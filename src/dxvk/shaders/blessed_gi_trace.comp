@@ -1,0 +1,356 @@
+// blessed: gi probe trace -- one compute dispatch per frame, 16 rays/probe against the scene tlas
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// blessed: persistent probe storage, read-modify-write in place. One
+// invocation per probe *slot*; no cross-invocation access, so no barriers
+// are needed even though every invocation both reads and writes this
+// buffer. Layout: 13 floats per probe -- 12 SH coefficients (4 per channel,
+// DirectionalAmbient row order a_x,a_y,a_z,a_const -- see ProjectRay below)
+// plus 1 validity float (gi v1: >0.5 valid, temporally blended the same way
+// as the coefficients -- see the backface-hit counting in main()).
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedGiProbeBuffer {
+  float sh[];
+};
+
+// blessed: gi v1 -- one entry per tlas instance, same order/count the tlas
+// build used (BlessedScene::endFrame); indexed by
+// rayQueryGetIntersectionInstanceIdEXT, the hardware instance-array index
+// (NOT instanceCustomIndex). Layout must match BlessedGiInstanceInfo in
+// blessed_gi_instance.h exactly.
+struct BlessedGiInstanceInfoEntry {
+  uint64_t vbAddress;
+  uint64_t ibAddress;      // rounded down to a 4-byte boundary -- see ibByteShift
+  uint     vbStride;
+  uint     vbFormatCode;   // 0 = rgb32f, 1 = rgba32f (unused, collapsed host-side), 2 = rgba16f
+  uint     indexTypeCode;  // 0 = uint16, 1 = uint32
+  uint     primitiveOffsetBytes;
+  int      baseVertex;
+  uint     albedoId;
+  uint     ibByteShift;    // 0 or 2 -- true byte offset of index 0 from ibAddress
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer BlessedGiInstanceInfoBuffer {
+  BlessedGiInstanceInfoEntry entries[];
+};
+
+// blessed: gi v1 -- one flat albedo colour per distinct diffuse texture,
+// linear, id 0 reserved (never written -- see BlessedGiState::ensureAlbedo).
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer BlessedGiAlbedoBuffer {
+  vec4 rgb[];
+};
+
+// blessed: gi v1 -- raw device-address reads of the game's own vertex/index
+// buffers, for the real hit normal. Declared as plain uint/float arrays
+// (never uint16_t/half) so no 16-bit shader storage extension is needed:
+// a uint16 index buffer is read as packed uint32 words (see fetchIndex),
+// and an R16G16B16A16_SFLOAT position stream via unpackHalf2x16 (core
+// GLSL, no extension) -- see fetchPosition.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer GiUintBuffer {
+  uint v[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer GiFloatBuffer {
+  float v[];
+};
+
+layout(push_constant, scalar) uniform BlessedGiTracePushData {
+  uint64_t  tlasAddress;
+  BlessedGiProbeBuffer probes;
+  uint64_t  instanceInfoAddress; // gi v1 -- 0 if the scene had no static instances this frame
+  uint64_t  albedoBufferAddress; // gi v1 -- 0 until the first texture dispatch has landed
+  vec3      camPos;      // this frame's tlas camera position, absolute
+  ivec3     originCell;  // window origin, absolute integer cell coords
+  ivec3     dims;        // grid dimensions
+  float     spacing;     // world units per cell
+  float     rotAngle;    // per-frame azimuth offset for the ray pattern
+  vec3      sunDir;
+  vec3      sunColor;
+  float     albedo;      // BLESSED_GI_ALBEDO -- fallback for albedoId 0 / v0Mode / unknown mesh
+  float     skyMul;      // BLESSED_GI_SKY
+  float     skyBounce;   // gi v1 -- BLESSED_GI_SKYBOUNCE
+  float     ambientRow[12]; // vanilla DirectionalAmbient, captured pre-zero,
+                            // row-major 3x4: row c = (a_x,a_y,a_z,a_const)
+  float     alpha;       // temporal blend factor
+  uint      raysPerProbe;
+  uint      instanceInfoCount; // gi v1
+  float     backfaceThreshold; // gi v1 -- BLESSED_GI_BACKFACE
+  uint      v0Mode;            // gi v1 -- bit 0: BLESSED_GI_V0=1 (old constant-albedo/-dir-normal path); bit 1: BLESSED_GI_WINDING=flip
+  uint      probeStride;       // gi-bounds -- 13, or 14 when BLESSED_GI_SAMPLE=bounds adds openness at [13]
+} pc;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// blessed: GLSL's `%` on signed ints follows the dividend's sign (like C);
+// this always returns a value in [0, n).
+int wrapMod(int x, int n) {
+  int r = x % n;
+  return r < 0 ? r + n : r;
+}
+
+// blessed: fibonacci-sphere direction #i of N, azimuth offset by rotAngle
+// (this frame's rotation of the whole pattern -- see BlessedGiState::runTrace).
+vec3 SphereDir(uint i, uint n, float rotAngle) {
+  float fi = float(i) + 0.5;
+  float phi = acos(1.0 - 2.0 * fi / float(n));
+  float theta = 3.14159265 * (1.0 + 2.2360680) * fi + rotAngle; // pi*(1+sqrt(5))
+  return vec3(sin(phi) * cos(theta), cos(phi), sin(phi) * sin(theta));
+}
+
+// blessed: vanilla's own ambient evaluation (Lighting.hlsl's
+// mul(DirectionalAmbient, float4(n,1))) as our sky-miss function -- same
+// row_major float3x4 form as the probe fit itself (see ProjectRay).
+vec3 EvalAmbientRow(vec3 n) {
+  vec3 out_ = vec3(0.0);
+  for (int c = 0; c < 3; c++) {
+    float a_x = pc.ambientRow[c * 4 + 0];
+    float a_y = pc.ambientRow[c * 4 + 1];
+    float a_z = pc.ambientRow[c * 4 + 2];
+    float a_c = pc.ambientRow[c * 4 + 3];
+    out_[c] = a_x * n.x + a_y * n.y + a_z * n.z + a_c;
+  }
+  return max(out_, vec3(0.0));
+}
+
+// blessed: gi v1 -- one index element (0-based within the geometry's own
+// built range, i.e. rayQueryGetIntersectionPrimitiveIndexEXT's own
+// convention: primIndex*3 + corner, NOT including primitiveOffsetBytes,
+// which this adds). ibAddress is 4-byte-aligned already; ibByteShift (0 or
+// 2) plus primitiveOffsetBytes plus this element's own byte offset select
+// which half (uint16) or whole (uint32) word to return.
+uint fetchIndex(uint64_t ibAddress, uint ibByteShift, uint primitiveOffsetBytes,
+                uint indexTypeCode, uint elementIndex) {
+  uint elemSize = indexTypeCode == 0u ? 2u : 4u;
+  uint byteOffset = ibByteShift + primitiveOffsetBytes + elementIndex * elemSize;
+  uint wordIndex = byteOffset >> 2;
+
+  GiUintBuffer buf = GiUintBuffer(ibAddress);
+  uint word = buf.v[wordIndex];
+
+  if (indexTypeCode == 0u) {
+    uint sub = (byteOffset & 2u) != 0u ? 1u : 0u;
+    return (word >> (sub * 16u)) & 0xFFFFu;
+  }
+  return word;
+}
+
+// blessed: gi v1 -- one vertex's xyz, rgb32f only (vbFormatCode 0; rgba32f
+// is collapsed to it host-side). vbAddress already carries this instance's
+// own vb byte offset (attribute offset + binding offset) -- the same
+// address the blas build itself used as an AS-build vertex data address,
+// which trusts it 4-byte aligned. R32G32B32_SFLOAT's 4-byte components
+// make that safe; rgba16f (vbFormatCode 2) is deliberately NOT read here
+// (its own attribute offset is only guaranteed 2-byte aligned, which a
+// buffer_reference declared 4-byte aligned must not assume) -- the caller
+// checks vbFormatCode before calling this, see main()'s hasGeometry gate.
+vec3 fetchPosition(uint64_t vbAddress, uint stride, uint vertexIndex) {
+  uint64_t base = vbAddress + uint64_t(vertexIndex) * uint64_t(stride);
+  GiFloatBuffer buf = GiFloatBuffer(base);
+  return vec3(buf.v[0], buf.v[1], buf.v[2]);
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint total = uint(pc.dims.x) * uint(pc.dims.y) * uint(pc.dims.z);
+  if (idx >= total)
+    return;
+
+  // decode window-relative offset (i,j,k) in [0,dims) from the linear id
+  int i = int(idx % uint(pc.dims.x));
+  int j = int((idx / uint(pc.dims.x)) % uint(pc.dims.y));
+  int k = int(idx / uint(pc.dims.x * pc.dims.y));
+
+  ivec3 absCell = pc.originCell + ivec3(i, j, k);
+
+  // blessed: toroidal addressing -- a probe's storage slot depends only on
+  // its own absolute cell (wrapped into [0,dims)), never on the window
+  // origin. A world cell that stays in range keeps writing the same slot
+  // every frame, independent of camera drift; one that leaves the window
+  // stops being retraced until some other cell wraps onto its old slot.
+  ivec3 slot = ivec3(wrapMod(absCell.x, pc.dims.x),
+                      wrapMod(absCell.y, pc.dims.y),
+                      wrapMod(absCell.z, pc.dims.z));
+  uint slotLinear = uint(slot.x) + uint(slot.y) * uint(pc.dims.x)
+                  + uint(slot.z) * uint(pc.dims.x) * uint(pc.dims.y);
+
+  vec3 absWorldPos = (vec3(absCell) + 0.5) * pc.spacing;
+  vec3 rayOrigin   = absWorldPos - pc.camPos; // camera-relative, matches the tlas
+
+  // blessed: least-squares fit of L(d) ~= c + a.d over uniformly sampled
+  // directions -- c = mean(L), a = 3*mean(L*d) (E[d (x) d] = I/3 for a
+  // uniform sphere). This basis is *defined* to match
+  // DirectionalAmbient's own evaluation (row.xyz . n + row.w), so no
+  // further conversion is needed to write it back into that cbuffer slot.
+  vec3 sumConst = vec3(0.0);
+  vec3 sumX = vec3(0.0);
+  vec3 sumY = vec3(0.0);
+  vec3 sumZ = vec3(0.0);
+
+  // blessed: gi v1 -- probes-inside-walls fix. Counts hits whose real
+  // triangle normal faces the same way as the ray that hit it (backface,
+  // per the standard "hit the far side of the winding" test) -- only
+  // countable when a real per-triangle normal was available at all
+  // (v1, non-v0Mode, a static instance with instance-info geometry).
+  uint backfaceHits = 0u;
+
+  // blessed: gi-bounds -- rays that missed all geometry (reached the sky)
+  uint skyMisses = 0u;
+
+  uint n = max(pc.raysPerProbe, 1u);
+  for (uint r = 0u; r < n; r++) {
+    vec3 dir = SphereDir(r, n, pc.rotAngle);
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, accelerationStructureEXT(pc.tlasAddress),
+      gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, 1.0, dir, 100000.0);
+    while (rayQueryProceedEXT(rq)) { }
+
+    bool hit = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+    vec3 radiance;
+
+    if (!hit) {
+      radiance = EvalAmbientRow(dir) * pc.skyMul;
+      skyMisses++;
+    } else {
+      float hitT = rayQueryGetIntersectionTEXT(rq, true);
+      vec3 hitPos = rayOrigin + dir * hitT;
+
+      // blessed: v0's shading normal -- kept as the default/fallback for
+      // v0Mode, an unknown mesh (no instance-info entry), or a skinned
+      // instance (sentinel vbAddress == 0, see BlessedScene::processSkinnedDraws).
+      vec3 shadingNormal = -dir;
+      vec3 albedoColor = vec3(pc.albedo);
+
+      if ((pc.v0Mode & 1u) == 0u && pc.instanceInfoAddress != uint64_t(0)) {
+        uint instId = uint(rayQueryGetIntersectionInstanceIdEXT(rq, true));
+
+        if (instId < pc.instanceInfoCount) {
+          BlessedGiInstanceInfoBuffer infos = BlessedGiInstanceInfoBuffer(pc.instanceInfoAddress);
+          BlessedGiInstanceInfoEntry inst = infos.entries[instId];
+
+          if (inst.vbAddress != uint64_t(0)) {
+            // blessed: albedo doesn't depend on the position format -- read
+            // it regardless of whether the real-normal fetch below can run.
+            if (pc.albedoBufferAddress != uint64_t(0)) {
+              BlessedGiAlbedoBuffer albedos = BlessedGiAlbedoBuffer(pc.albedoBufferAddress);
+              albedoColor = albedos.rgb[inst.albedoId].rgb;
+            }
+
+            // blessed: real hit normal only for rgb32f positions -- see
+            // fetchPosition's own comment on why rgba16f (vbFormatCode 2)
+            // is deliberately excluded (its attribute offset's alignment
+            // isn't safe for this function's buffer_reference). Such a mesh
+            // keeps the -ray-direction fallback, same as v0.
+            if (inst.vbFormatCode == 0u) {
+              uint primIndex = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+
+              uint i0 = fetchIndex(inst.ibAddress, inst.ibByteShift, inst.primitiveOffsetBytes, inst.indexTypeCode, primIndex * 3u + 0u);
+              uint i1 = fetchIndex(inst.ibAddress, inst.ibByteShift, inst.primitiveOffsetBytes, inst.indexTypeCode, primIndex * 3u + 1u);
+              uint i2 = fetchIndex(inst.ibAddress, inst.ibByteShift, inst.primitiveOffsetBytes, inst.indexTypeCode, primIndex * 3u + 2u);
+
+              uint v0i = uint(int(i0) + inst.baseVertex);
+              uint v1i = uint(int(i1) + inst.baseVertex);
+              uint v2i = uint(int(i2) + inst.baseVertex);
+
+              vec3 p0 = fetchPosition(inst.vbAddress, inst.vbStride, v0i);
+              vec3 p1 = fetchPosition(inst.vbAddress, inst.vbStride, v1i);
+              vec3 p2 = fetchPosition(inst.vbAddress, inst.vbStride, v2i);
+
+              vec3 objNormal = normalize(cross(p1 - p0, p2 - p0));
+
+              mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+              vec3 worldNormal = normalize(mat3(o2w) * objNormal);
+
+              // blessed: backface test -- a properly wound front face's
+              // normal opposes the incoming ray (dot < 0); a hit from
+              // inside the mesh sees the inner surface's normal pointing
+              // the same way the ray travels (dot > 0).
+              // a mirrored instance (negative determinant) flips winding;
+              // BLESSED_GI_WINDING=flip inverts the convention for a/b.
+              bool flipWinding = (determinant(mat3(o2w)) < 0.0) != ((pc.v0Mode & 2u) != 0u);
+              bool backfaceHit = (dot(worldNormal, dir) > 0.0) != flipWinding;
+              if (backfaceHit)
+                worldNormal = -worldNormal; // flip for shading regardless
+
+              shadingNormal = worldNormal;
+              if (backfaceHit)
+                backfaceHits++;
+            }
+          }
+        }
+      }
+
+      float ndotl = max(0.0, dot(shadingNormal, pc.sunDir));
+      float sunVis = 1.0;
+
+      if (ndotl > 0.0) {
+        rayQueryEXT sq;
+        rayQueryInitializeEXT(sq, accelerationStructureEXT(pc.tlasAddress),
+          gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+          hitPos + shadingNormal * 0.5, 1.0, pc.sunDir, 100000.0);
+        while (rayQueryProceedEXT(sq)) { }
+        bool shadowed = rayQueryGetIntersectionTypeEXT(sq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+        sunVis = shadowed ? 0.0 : 1.0;
+      }
+
+      // blessed: gi v1 -- direct sun bounce, plus a cheap second-bounce
+      // stand-in (albedo x vanilla's own sky ambient evaluated at the real
+      // normal x BLESSED_GI_SKYBOUNCE). Zero in v0Mode (skyBounce forced 0
+      // via the host-side push, so this term vanishes without a branch).
+      radiance = albedoColor * pc.sunColor * ndotl * sunVis
+               + albedoColor * EvalAmbientRow(shadingNormal) * pc.skyBounce;
+    }
+
+    sumConst += radiance;
+    sumX += radiance * dir.x;
+    sumY += radiance * dir.y;
+    sumZ += radiance * dir.z;
+  }
+
+  float invN = 1.0 / float(n);
+  vec3 fitConst = sumConst * invN;
+  vec3 fitX = 3.0 * sumX * invN;
+  vec3 fitY = 3.0 * sumY * invN;
+  vec3 fitZ = 3.0 * sumZ * invN;
+
+  uint base = slotLinear * pc.probeStride;
+  for (int c = 0; c < 3; c++) {
+    float newX = c == 0 ? fitX.x : (c == 1 ? fitX.y : fitX.z);
+    float newY = c == 0 ? fitY.x : (c == 1 ? fitY.y : fitY.z);
+    float newZ = c == 0 ? fitZ.x : (c == 1 ? fitZ.y : fitZ.z);
+    float newC = c == 0 ? fitConst.x : (c == 1 ? fitConst.y : fitConst.z);
+
+    float prevX = pc.probes.sh[base + c * 4 + 0];
+    float prevY = pc.probes.sh[base + c * 4 + 1];
+    float prevZ = pc.probes.sh[base + c * 4 + 2];
+    float prevC = pc.probes.sh[base + c * 4 + 3];
+
+    pc.probes.sh[base + c * 4 + 0] = mix(prevX, newX, pc.alpha);
+    pc.probes.sh[base + c * 4 + 1] = mix(prevY, newY, pc.alpha);
+    pc.probes.sh[base + c * 4 + 2] = mix(prevZ, newZ, pc.alpha);
+    pc.probes.sh[base + c * 4 + 3] = mix(prevC, newC, pc.alpha);
+  }
+
+  // blessed: gi v1 -- probe validity, temporally blended like the
+  // coefficients above so a probe doesn't flicker valid/invalid frame to
+  // frame. Fraction is of *all* rays (matching the brief exactly), not just
+  // the ones that resolved real geometry -- backfaceHits stays 0 whenever
+  // geomHits is 0 (v0Mode, or every hit this frame was an unknown
+  // mesh/skinned actor), so this is always valid then too, matching v0.
+  bool invalidThisFrame = float(backfaceHits) / float(n) > pc.backfaceThreshold;
+  float prevValid = pc.probes.sh[base + 12];
+  float newValid = invalidThisFrame ? 0.0 : 1.0;
+  pc.probes.sh[base + 12] = mix(prevValid, newValid, pc.alpha);
+
+  // blessed: gi-bounds -- openness, the fraction of rays that escaped to
+  // the sky, blended like the rest. Only stored when the host asked for
+  // the wider stride (BLESSED_GI_SAMPLE=bounds).
+  if (pc.probeStride > 13u) {
+    float prevOpen = pc.probes.sh[base + 13];
+    float newOpen = float(skyMisses) / float(n);
+    pc.probes.sh[base + 13] = mix(prevOpen, newOpen, pc.alpha);
+  }
+}

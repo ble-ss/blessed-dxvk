@@ -5,6 +5,7 @@
 #include "../dxvk/hud/dxvk_hud.h"
 
 #include "../dxvk/dxvk_latency.h"
+#include "../dxvk/dxvk_presenter.h" // blessed: zero-copy-present, PresenterSync
 #include "../dxvk/dxvk_swapchain_blitter.h"
 
 #include "../util/sync/sync_signal.h"
@@ -13,9 +14,12 @@ namespace dxvk {
   
   class D3D11Device;
   class D3D11DXGIDevice;
+  class D3D11ThreadedContext; // blessed: threaded-fe-2
+  class BlessedZeroCopy; // blessed: zero-copy-present
 
   class D3D11SwapChain : public ComObject<IDXGIVkSwapChain3> {
     constexpr static uint32_t DefaultFrameLatency = 1;
+    friend class BlessedZeroCopy; // blessed: zero-copy-present
   public:
 
     D3D11SwapChain(
@@ -96,7 +100,22 @@ namespace dxvk {
     HRESULT STDMETHODCALLTYPE SetRotation(
             DXGI_MODE_ROTATION        Rotation);
 
+    // blessed: threaded-fe-2 -- the front end's replay of a recorded
+    // Present, see blessed_threaded_present.cpp
+    HRESULT BlessedReplayPresent(
+            UINT                      SyncInterval,
+            UINT                      PresentFlags,
+      const DXGI_PRESENT_PARAMETERS*  pPresentParameters,
+            uint64_t*                 pFrameId);
+
   private:
+
+    // blessed: threaded-fe-2 -- the game-side half of a recorded Present
+    HRESULT BlessedRecordPresent(
+            D3D11ThreadedContext*     pFrontEnd,
+            UINT                      SyncInterval,
+            UINT                      PresentFlags,
+      const DXGI_PRESENT_PARAMETERS*  pPresentParameters);
 
     using DirtyRectList = small_vector<VkRectLayerKHR, 4>;
 
@@ -142,6 +161,10 @@ namespace dxvk {
     VkColorSpaceKHR           m_colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkClearColorValue         m_clearColor = {};
 
+    // blessed: zero-copy-present -- SetGammaControl mirrors whether a
+    // non-identity ramp is active, checked by BlessedTryEarlyAcquire
+    bool                      m_hasGammaRamp = false;
+
     double                    m_targetFrameRate = 0.0;
 
     dxvk::mutex               m_frameStatisticsLock;
@@ -150,7 +173,40 @@ namespace dxvk {
     bool                      m_hasHud = false;
     Rc<hud::HudLatencyItem>   m_latencyHud;
 
+    // blessed: zero-copy-present -- the image BlessedTryEarlyAcquire holds
+    // until PresentImage (or BlessedReleaseEarlyAcquire) presents it; whether
+    // its acquire semaphore is already attached to a command list; and a
+    // latch, reset by CreateBackBuffers, for a swap image that cannot take
+    // the redirect. See blessed_zero_copy.h.
+    bool                      m_zcAcquired = false;
+    bool                      m_zcWaitEmitted = false;
+    bool                      m_zcMismatch = false;
+    PresenterSync             m_zcSync = {};
+    Rc<DxvkImage>             m_zcImage;
+
+    // blessed: zero-copy-present, present-mode fix -- the sync interval the
+    // last real Present configured on m_presenter. BlessedTryEarlyAcquire
+    // declines until it is known, so the swap chain is never created
+    // before the game's first Present has set its interval.
+    bool                      m_blessedSyncIntervalKnown = false;
+    UINT                      m_blessedSyncInterval = 0;
+
     Rc<DxvkImageView> GetBackBufferView();
+
+    // blessed: zero-copy-present -- flushes, acquires the swap chain image
+    // early and attaches its acquire semaphore to the command list that
+    // starts here. Returns the acquired image, or null if this frame keeps
+    // the normal path.
+    Rc<DxvkImage> BlessedTryEarlyAcquire(D3D11ImmediateContext* ctx);
+
+    // blessed: zero-copy-present -- copies the acquired image back into the
+    // real back buffer when a redirect falls back mid-frame
+    void BlessedCorrectBackBufferForRead(
+            D3D11ImmediateContext*  ctx,
+      const Rc<DxvkImage>&          swapImage);
+
+    // blessed: zero-copy-present -- presents a held early acquire as is
+    void BlessedReleaseEarlyAcquire();
 
     HRESULT PresentImage(
             UINT                      SyncInterval,

@@ -1,0 +1,105 @@
+// blessed: BLESSED_POINT_SOFT pass 2/2 -- 5x5 depth-aware blur of one light's accumulated channel into its mask channel(s)
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+// blessed: pass 1's output: visibility per channel, and the surfaces
+layout(set = 1, binding = 0)
+uniform texture2D s_visIn;
+
+layout(set = 1, binding = 1)
+uniform texture2D s_posIn;
+
+// blessed: the real shadow mask, rgba8, this light's channel(s) only
+layout(set = 1, binding = 2, rgba8)
+uniform image2D s_output;
+
+// blessed: same header as blessed_point_soft_trace.comp
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedPointSoftConstants {
+  mat4  invViewProj;
+  mat4  prevViewProj;
+  vec3  camDelta;
+  vec3  lightPos;
+  vec3  reprojDelta;
+  float radius;
+  float proxyRadius;
+  float lightRadius;
+  float farDepthValue;
+  uint  spp;
+  uint  frameIndex;
+  uint  channel;
+  uint  historyValid;
+  uint  width;
+  uint  height;
+  uint  tlasValid;
+  uint  debugMode;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedPointPixels {
+  uint data[];
+};
+
+layout(push_constant, scalar) uniform BlessedPointSoftPush {
+  uint64_t constantsAddress;
+  uint64_t tlasAddress;    // trace pass only
+  uint64_t debugAddress;   // BLESSED_POINT_DUMP pixel buffer, or 0
+  uint     samplerIndex;
+  uint     channelMask;    // the draw's write mask
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float ACCUM_TO_POS = 64.0;
+
+void main() {
+  BlessedPointSoftConstants k = BlessedPointSoftConstants(pc.constantsAddress);
+
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(k.width) || coord.y >= int(k.height))
+    return;
+
+  uint c = k.channel;
+  float centerVis = texelFetch(sampler2D(s_visIn, s_samplers[pc.samplerIndex]), coord, 0)[c];
+  float centerDist = length(texelFetch(sampler2D(s_posIn, s_samplers[pc.samplerIndex]), coord, 0).xyz) * ACCUM_TO_POS;
+  float visibility = centerVis;
+
+  if (k.debugMode != 7u && centerDist > 0.0) {
+    float sumW = 0.0;
+    float sumV = 0.0;
+    ivec2 maxCoord = ivec2(int(k.width) - 1, int(k.height) - 1);
+
+    for (int dy = -2; dy <= 2; dy++) {
+      for (int dx = -2; dx <= 2; dx++) {
+        ivec2 p = clamp(coord + ivec2(dx, dy), ivec2(0), maxCoord);
+        float sDist = length(texelFetch(sampler2D(s_posIn, s_samplers[pc.samplerIndex]), p, 0).xyz) * ACCUM_TO_POS;
+        if (sDist == 0.0)
+          continue;
+
+        float w = exp(-abs(sDist - centerDist) / max(centerDist * 0.05, 1.0));
+        sumW += w;
+        sumV += w * texelFetch(sampler2D(s_visIn, s_samplers[pc.samplerIndex]), p, 0)[c];
+      }
+    }
+
+    visibility = sumW > 0.0 ? sumV / sumW : centerVis;
+  }
+
+  uint mask = pc.channelMask;
+  vec4 prev = imageLoad(s_output, coord);
+  imageStore(s_output, coord, vec4(
+    (mask & 1u) != 0u ? visibility : prev.x,
+    (mask & 2u) != 0u ? visibility : prev.y,
+    (mask & 4u) != 0u ? visibility : prev.z,
+    (mask & 8u) != 0u ? visibility : prev.w));
+
+  if (pc.debugAddress != 0ul) {
+    BlessedPointPixels dump = BlessedPointPixels(pc.debugAddress + 16ul);
+    dump.data[coord.y * int(k.width) + coord.x] = uint(round(clamp(visibility, 0.0, 1.0) * 255.0));
+  }
+}

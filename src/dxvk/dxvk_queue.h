@@ -215,7 +215,15 @@ namespace dxvk {
     dxvk::condition_variable    m_submitCond;
     dxvk::condition_variable    m_finishCond;
 
-    std::queue<DxvkSubmitEntry> m_submitQueue;
+    // blessed: present-idle -- a std::queue that can also take the entry
+    // behind the front one (BLESSED_PRESENT=defer)
+    struct BlessedSubmitQueue : std::queue<DxvkSubmitEntry> {
+      DxvkSubmitEntry& at(size_t i) { return c[i]; }
+      void eraseAt(size_t i) { c.erase(c.begin() + i); }
+    };
+
+    BlessedSubmitQueue          m_submitQueue; // blessed: present-idle, was std::queue
+    std::atomic<uint32_t>       m_blessedWaiters = { 0u }; // blessed: present-idle, threads in synchronize*/waitForIdle
     std::queue<DxvkSubmitEntry> m_finishQueue;
 
     dxvk::thread                m_submitThread;
@@ -224,6 +232,13 @@ namespace dxvk {
     void submitCmdLists();
 
     void finishCmdLists();
+
+    // blessed: present-idle -- defer mode: index of the entry to submit
+    // next (1 lets a command list go before a queued present), m_mutex held.
+    // blessed/blessed_present.cpp
+    size_t blessedDeferPick(
+            std::unique_lock<dxvk::mutex>& lock,
+            bool&                          deferred);
     
   };
   

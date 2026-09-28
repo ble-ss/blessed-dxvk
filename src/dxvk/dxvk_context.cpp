@@ -8,6 +8,12 @@
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 
+// blessed: rt selftest plumbing
+#include "blessed/blessed_gi.h"
+#include "blessed/blessed_rt.h"
+#include "blessed/blessed_scene.h"
+#include <blessed_rt_selftest.h>
+
 namespace dxvk {
   
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
@@ -81,11 +87,14 @@ namespace dxvk {
     // Set up renderdoc capture helper
     if (m_device->debugFlags().test(DxvkDebugFlag::Capture))
       m_framesToCapture = parseFrameCaptureEnv();
+
+    // blessed: vrs -- no-op unless the device enabled the feature
+    blessedVrsCreate();
   }
-  
-  
+
+
   DxvkContext::~DxvkContext() {
-    
+    blessedVrsDestroy(); // blessed: vrs
   }
   
   
@@ -161,6 +170,26 @@ namespace dxvk {
   void DxvkContext::flushCommandList(
     const VkDebugUtilsLabelEXT*       reason,
           DxvkSubmitStatus*           status) {
+    // blessed: vol-async-3 -- a flush inside the vol-async window (a cpu
+    // readback that has to wait, e.g. vol-collapse's own verify diff at
+    // the chain's end, or dxvk's own implicit flush) ends the kick here:
+    // the list submitted below must not carry a half-recorded kick. The
+    // rest of the window records on graphics, so the next list waits for
+    // the kick first thing (see below): a wait recorded here would sit in
+    // an empty chunk, which is never submitted.
+    bool blessedWaitNextList = false;
+
+    if (unlikely(m_blessedVolAsyncActive)) {
+      blessedVolAsyncEnd();
+      blessedWaitNextList = true;
+      m_blessedVolStats.cutByFlush += 1u;
+    }
+
+    // blessed: cb-mirror -- one copy per touched ring block, batching this
+    // submission's cbuffer writes to their vram mirrors. No-op (an empty
+    // vector check) whenever d3d11.blessedCbMirror is off.
+    blessedFlushCbMirror();
+
     // If necessary, block any async queue on previous command completion
     if (m_submitWaitId)
       m_cmd->waitFence(m_trackingFence, std::exchange(m_submitWaitId, 0ull));
@@ -198,6 +227,10 @@ namespace dxvk {
 
     this->beginRecording(
       m_device->createCommandList());
+
+    // blessed: vol-async-3 -- see the top of this function
+    if (unlikely(blessedWaitNextList))
+      blessedAsyncSync();
   }
 
 
@@ -1390,6 +1423,268 @@ namespace dxvk {
 
       m_common->memoryManager().lockResourceGpuAddress(buffer->storage());
     }
+  }
+
+
+  namespace {
+    // blessed: push data layout must match BlessedRtSelftestPushData in
+    // shaders/blessed_rt_selftest.comp exactly (2x uint64, scalar layout)
+    struct BlessedRtSelfTestPushData {
+      VkDeviceAddress tlasAddress;
+      VkDeviceAddress outputAddress;
+    };
+  }
+
+
+  void DxvkContext::blessedRunSelfTest() {
+    BlessedRt* rt = m_device->blessedRt();
+
+    if (!rt) {
+      Logger::warn("blessed: rt selftest requested but ray query is unavailable");
+      return;
+    }
+
+    // blessed: this always runs on a dedicated throwaway context (see
+    // BlessedRt::runSelfTestOnce) that never binds a render target, so
+    // there should be no active pass here -- but the raw AS build/barrier
+    // commands below are illegal inside one (VUID-vkCmdBuildAccelerationStructuresKHR-renderpass),
+    // so guard it the same way blessedSceneAddDraw/EndFrame do rather than
+    // rely on that invariant.
+    endCurrentPass(true);
+
+    // Triangle (0,0,5) (1,0,5) (0,1,5), identity transform, non-indexed.
+    const float vertices[9] = {
+      0.0f, 0.0f, 5.0f,
+      1.0f, 0.0f, 5.0f,
+      0.0f, 1.0f, 5.0f,
+    };
+
+    DxvkBufferCreateInfo vertexInfo = { };
+    vertexInfo.size    = sizeof(vertices);
+    vertexInfo.usage   = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                       | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    vertexInfo.stages  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    vertexInfo.access  = VK_ACCESS_2_SHADER_READ_BIT;
+    vertexInfo.debugName = "blessed rt selftest vertices";
+
+    Rc<DxvkBuffer> vertexBuffer = m_device->createBuffer(vertexInfo,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::memcpy(vertexBuffer->getSliceInfo().mapPtr, vertices, sizeof(vertices));
+    ensureBufferAddress(vertexBuffer);
+
+    // blessed: rt-lifetime -- BlessedAccelStruct is now ref-counted, see blessed_rt.h
+    Rc<BlessedAccelStruct> blas = rt->recordBuildBlas(this, m_cmd,
+      vertexBuffer->getSliceInfo().gpuAddress);
+
+    // blas write -> tlas read (instance references the blas) and the write-
+    // after-write on scratch if the tlas build reuses the same buffer.
+    VkMemoryBarrier2 blasToTlas = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    blasToTlas.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    blasToTlas.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    blasToTlas.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    blasToTlas.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                             | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+
+    VkDependencyInfo blasToTlasDep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    blasToTlasDep.memoryBarrierCount = 1u;
+    blasToTlasDep.pMemoryBarriers    = &blasToTlas;
+
+    // blessed: raw -- manual VkDependencyInfo, not dxvk's tracked barrier batcher
+    m_cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &blasToTlasDep);
+
+    VkAccelerationStructureInstanceKHR instance = { };
+    instance.transform.matrix[0][0] = 1.0f;
+    instance.transform.matrix[1][1] = 1.0f;
+    instance.transform.matrix[2][2] = 1.0f;
+    instance.mask  = 0xFFu;
+    instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    instance.accelerationStructureReference = blas->address(); // blessed: rt-lifetime, now Rc<>-held
+
+    DxvkBufferCreateInfo instanceInfo = { };
+    instanceInfo.size    = sizeof(instance);
+    instanceInfo.usage   = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                          | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    instanceInfo.stages  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    instanceInfo.access  = VK_ACCESS_2_SHADER_READ_BIT;
+    instanceInfo.debugName = "blessed rt selftest instance";
+
+    Rc<DxvkBuffer> instanceBuffer = m_device->createBuffer(instanceInfo,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::memcpy(instanceBuffer->getSliceInfo().mapPtr, &instance, sizeof(instance));
+    ensureBufferAddress(instanceBuffer);
+
+    // blessed: rt-lifetime -- BlessedAccelStruct is now ref-counted, see blessed_rt.h
+    Rc<BlessedAccelStruct> tlas = rt->recordBuildTlas(this, m_cmd,
+      instanceBuffer->getSliceInfo().gpuAddress, 1u);
+
+    // tlas write -> ray query read in the compute shader. Per VK_KHR_ray_query,
+    // ACCELERATION_STRUCTURE_READ_BIT_KHR is valid at any shader stage, not
+    // just VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR.
+    VkMemoryBarrier2 tlasToShader = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    tlasToShader.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    tlasToShader.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    tlasToShader.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    tlasToShader.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+
+    VkDependencyInfo tlasToShaderDep = { VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    tlasToShaderDep.memoryBarrierCount = 1u;
+    tlasToShaderDep.pMemoryBarriers    = &tlasToShader;
+
+    // blessed: raw
+    m_cmd->cmdPipelineBarrier(DxvkCmdBuffer::ExecBuffer, &tlasToShaderDep);
+
+    DxvkBufferCreateInfo outputInfo = { };
+    outputInfo.size    = sizeof(uint32_t) * 4u;
+    outputInfo.usage   = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    outputInfo.stages  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    outputInfo.access  = VK_ACCESS_2_SHADER_WRITE_BIT;
+    outputInfo.debugName = "blessed rt selftest output";
+
+    Rc<DxvkBuffer> outputBuffer = m_device->createBuffer(outputInfo,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    std::memset(outputBuffer->getSliceInfo().mapPtr, 0, outputInfo.size);
+    ensureBufferAddress(outputBuffer);
+
+    // blessed: createBuiltInPipelineLayout interns by key, so this is cheap
+    // even though nothing currently calls blessedRunSelfTest twice.
+    const DxvkPipelineLayout* layout = m_device->createBuiltInPipelineLayout(
+      DxvkPipelineLayoutFlags(), VK_SHADER_STAGE_COMPUTE_BIT,
+      sizeof(BlessedRtSelfTestPushData), 0u, nullptr);
+
+    util::DxvkBuiltInShaderStage shaderStage(blessed_rt_selftest, nullptr);
+    VkPipeline pipeline = m_device->createBuiltInComputePipeline(layout, shaderStage);
+
+    BlessedRtSelfTestPushData pushData = { };
+    pushData.tlasAddress   = tlas->address(); // blessed: rt-lifetime, now Rc<>-held
+    pushData.outputAddress = outputBuffer->getSliceInfo().gpuAddress;
+
+    m_cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    m_cmd->bindResources(DxvkCmdBuffer::ExecBuffer, layout,
+      0u, nullptr, sizeof(pushData), &pushData);
+    m_cmd->cmdDispatch(DxvkCmdBuffer::ExecBuffer, 1u, 1u, 1u);
+
+    Rc<DxvkCommandList> cmdList = this->endRecording(nullptr);
+
+    DxvkSubmitStatus status = { };
+    m_device->submitCommandList(cmdList, nullptr, 0u, &status);
+    m_device->waitForSubmission(&status);
+    m_device->waitForIdle();
+
+    const uint32_t* results = reinterpret_cast<const uint32_t*>(outputBuffer->getSliceInfo().mapPtr);
+    uint32_t hits = 0u;
+    for (uint32_t i = 0u; i < 4u; i++)
+      hits += results[i] ? 1u : 0u;
+    uint32_t misses = 4u - hits;
+
+    const uint32_t expectedHits = 2u;
+    const uint32_t expectedMisses = 2u;
+
+    if (hits == expectedHits && misses == expectedMisses) {
+      Logger::info(str::format("blessed: rt selftest pass (hits=", hits, " misses=", misses,
+        ", expected ", expectedHits, "/", expectedMisses, ")"));
+    } else {
+      Logger::err(str::format("blessed: rt selftest FAIL (hits=", hits, " misses=", misses,
+        ", expected ", expectedHits, "/", expectedMisses, ")"));
+    }
+  }
+
+
+  void DxvkContext::blessedSceneAddDraw(
+    const BlessedSceneDraw&           draw) {
+    BlessedScene* scene = m_device->blessedScene();
+
+    if (likely(!scene))
+      return;
+
+    // blessed: addDraw only queues work (no commands), so the game's
+    // render pass stays intact; builds and barriers happen in endFrame.
+    scene->addDraw(this, m_cmd, draw);
+  }
+
+
+  void DxvkContext::blessedSceneEndFrame(uint32_t skinnedPass,
+    std::unique_ptr<BlessedSceneSkinBatch> skinBatch) {
+    BlessedScene* scene = m_device->blessedScene();
+
+    if (likely(!scene)) {
+      BlessedScene::recycleSkinBatch(std::move(skinBatch));
+      return;
+    }
+
+    // blessed: async-compute -- the builds below rewrite blas/tlas storage
+    // that an outstanding async kick (last frame's gi trace) may still read
+    blessedAsyncSync();
+
+    // blessed: endFrame records raw AS builds and barriers
+    // (VUID-vkCmdBuildAccelerationStructuresKHR-renderpass) -- this runs
+    // from D3D11SwapChain::Present, where a render pass may still be open
+    // from the game's last draw of the frame.
+    endCurrentPass(true);
+
+    scene->endFrame(this, m_cmd, skinnedPass, skinBatch.get()); // blessed: skin-v2, hook-cpu-2
+    BlessedScene::recycleSkinBatch(std::move(skinBatch));
+
+    // blessed: state-audit -- the skinning dispatch binds raw
+    this->invalidateState();
+  }
+
+
+  void DxvkContext::blessedGiNoteLighting(
+    const BlessedGiFrameLighting&    lighting) {
+    BlessedGiState* gi = m_device->blessedGi();
+
+    if (likely(!gi))
+      return;
+
+    gi->noteFrameLighting(lighting);
+  }
+
+
+  void DxvkContext::blessedGiNoteMeshAlbedo(
+    const BlessedGiMeshAlbedoNote&    note) {
+    BlessedGiState* gi = m_device->blessedGi();
+    BlessedScene*   scene = m_device->blessedScene();
+
+    if (likely(!gi || !scene))
+      return;
+
+    // blessed: ensureAlbedo only ever queues work (see its doc comment);
+    // safe to call here even though a render pass may still be open.
+    uint32_t albedoId = gi->ensureAlbedo(note.textureView, note.needsSrgbDecode);
+
+    scene->noteMeshAlbedo(
+      note.vb.buffer().ptr(), uint32_t(note.vb.offset()), note.vbStride, note.vbFormat,
+      note.ib.buffer().ptr(), uint32_t(note.ib.offset()), note.indexType,
+      note.indexCount, note.startIndex, note.baseVertex, albedoId);
+  }
+
+
+  void DxvkContext::blessedRunGiTrace() {
+    BlessedGiState* gi = m_device->blessedGi();
+
+    if (likely(!gi))
+      return;
+
+    // blessed: async-compute -- the albedo drain and bounds jobs rewrite
+    // buffers the previous trace read (a no-op after blessedSceneEndFrame)
+    blessedAsyncSync();
+
+    // blessed: the trace dispatch's own barriers are raw VkMemoryBarrier2s
+    // (see BlessedGiState::runTrace), same reasoning as blessedSceneEndFrame
+    // above -- called right after it, from the same ordered cs chunk.
+    endCurrentPass(true);
+
+    gi->runTrace(this, m_cmd);
+    this->invalidateState(); // blessed: state-audit -- the trace binds raw
+
+    // blessed: gi-cs -- the cs thread's frame boundary: copy the ready probe
+    // slot for the next frame's draws to sample (see refreshCsCache).
+    gi->refreshCsCache();
+  }
+
+
+  BlessedGiState* DxvkContext::blessedGi() const {
+    return m_device->blessedGi(); // blessed: gi-cs
   }
 
 
@@ -6145,6 +6440,10 @@ namespace dxvk {
 
   void DxvkContext::beginRenderPass() {
     if (!m_flags.test(DxvkContextFlag::GpRenderPassActive)) {
+      // blessed: vrs -- one pointer test when off
+      if (unlikely(m_blessedVrs))
+        blessedVrsPrePass();
+
       if (unlikely(m_features.test(DxvkContextFeature::DebugUtils)))
         popDebugRegion(util::DxvkDebugLabelType::InternalBarrierControl);
 
@@ -6317,7 +6616,8 @@ namespace dxvk {
 
       m_rtAccess.emplace_back(*depthAttachment.view, depthStages, depthAccess, !preserveAspects);
 
-      if (!prepareOutOfOrderTransition(*depthAttachment.view->image()))
+      if (!prepareOutOfOrderTransition(*depthAttachment.view->image())
+       && !blessedLayerTransitionOutOfOrder(*depthAttachment.view)) // blessed: perlayer
         cmdBuffer = DxvkCmdBuffer::ExecBuffer;
     }
 
@@ -6340,7 +6640,8 @@ namespace dxvk {
 
         m_rtAccess.emplace_back(*colorAttachment.view, colorStages, colorAccess, discard);
 
-        if (!prepareOutOfOrderTransition(*colorAttachment.view->image()))
+        if (!prepareOutOfOrderTransition(*colorAttachment.view->image())
+         && !blessedLayerTransitionOutOfOrder(*colorAttachment.view)) // blessed: perlayer
           cmdBuffer = DxvkCmdBuffer::ExecBuffer;
       }
     }
@@ -6350,6 +6651,16 @@ namespace dxvk {
     // render passes.
     if (!m_flags.test(DxvkContextFlag::GpRenderPassUnsynchronized))
       flushBarriers();
+
+    // blessed: perlayer -- acquireResources tracks the attachments, which
+    // marks all their layers; narrow the record back to the bound layers.
+    if (unlikely(g_blessedLayerTracking)) {
+      DxvkBlessedLayerSnapshot blessedLayers = blessedSnapshotAttachmentLayers(framebufferInfo);
+      acquireResources(cmdBuffer, m_rtAccess.size(), m_rtAccess.data(), false);
+      blessedRestoreAttachmentLayers(framebufferInfo, blessedLayers);
+      blessedCountLayerPass(cmdBuffer);
+      return;
+    }
 
     // Ignore clears, we should already have processed all of them.
     acquireResources(cmdBuffer, m_rtAccess.size(), m_rtAccess.data(), false);
@@ -6560,6 +6871,10 @@ namespace dxvk {
 
       m_cmd->beginSecondaryCommandBuffer(inheritance);
     } else {
+      // blessed: vrs -- the rate attachment on the matched lit pass only
+      if (unlikely(m_blessedVrs))
+        blessedVrsBeginRendering(renderingInfo);
+
       // Begin rendering right away on regular GPUs
       m_cmd->cmdBeginRendering(DxvkCmdBuffer::ExecBuffer, &renderingInfo);
     }
@@ -6572,6 +6887,12 @@ namespace dxvk {
 
       m_cmd->cmdClearAttachments(DxvkCmdBuffer::ExecBuffer, lateClearCount, lateClears.data(), 1, &clearRect);
     }
+
+    // blessed: perlayer -- the attachment tracks below only touch the bound layers
+    DxvkBlessedLayerSnapshot blessedLayers;
+
+    if (unlikely(g_blessedLayerTracking))
+      blessedLayers = blessedSnapshotAttachmentLayers(framebufferInfo);
 
     for (uint32_t i = 0; i < framebufferInfo.numAttachments(); i++) {
       const auto& attachment = framebufferInfo.getAttachment(i);
@@ -6586,6 +6907,9 @@ namespace dxvk {
         m_implicitResolves.invalidate(*attachment.view->image(), subresources);
       }
     }
+
+    if (unlikely(g_blessedLayerTracking)) // blessed: perlayer
+      blessedRestoreAttachmentLayers(framebufferInfo, blessedLayers);
 
     m_cmd->addStatCtr(DxvkStatCounter::CmdRenderPassCount, 1u);
   }
@@ -7948,6 +8272,10 @@ namespace dxvk {
 
   
   void DxvkContext::updateDynamicState() {
+    // blessed: vrs -- one pointer test when off
+    if (unlikely(m_blessedVrs))
+      blessedVrsUpdateDraw();
+
     if (unlikely(m_flags.all(DxvkContextFlag::GpDirtyViewport,
                              DxvkContextFlag::GpDynamicViewport))) {
       m_flags.clr(DxvkContextFlag::GpDirtyViewport);
@@ -10563,6 +10891,14 @@ namespace dxvk {
           DxvkCmdBuffer             cmdBuffer,
           size_t                    accessCount,
     const DxvkResourceAccess*       accessBatch) {
+    // blessed: vol-async-3 -- while an async kick is being recorded, the
+    // init and sdma buffers belong to the graphics chunk submitted *after*
+    // the kick: a transfer placed there would run after the kick reads its
+    // destination (vol-collapse's params UpdateSubresource, inside the
+    // window). Keep every transfer in order, in the kick itself.
+    if (unlikely(m_cmd->blessedAsyncRecording()))
+      return DxvkCmdBuffer::ExecBuffer;
+
     for (size_t i = 0u; i < accessCount; i++) {
       const auto& e = accessBatch[i];
 

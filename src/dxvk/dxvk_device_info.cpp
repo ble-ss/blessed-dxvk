@@ -8,6 +8,13 @@
 #include "dxvk_instance.h"
 #include "dxvk_limits.h"
 
+#include "blessed/blessed_gpu_gaps.h" // blessed: gpu-gaps
+
+#include "blessed/blessed_async.h" // blessed: async-compute
+#include "blessed/blessed_present.h" // blessed: present-idle
+
+#include "blessed/blessed_vrs.h" // blessed: vrs
+
 namespace dxvk {
 
   #define CORE_VERSIONS                            \
@@ -16,6 +23,9 @@ namespace dxvk {
     HANDLE_CORE(vk13);
 
   #define EXTENSIONS_WITH_FEATURES                 \
+    HANDLE_EXT(khrAccelerationStructure);          \
+    HANDLE_EXT(khrRayQuery);                       \
+    HANDLE_EXT(khrDeferredHostOperations);         \
     HANDLE_EXT(extAttachmentFeedbackLoopLayout);   \
     HANDLE_EXT(extBorderColorSwizzle);             \
     HANDLE_EXT(extConservativeRasterization);      \
@@ -45,6 +55,7 @@ namespace dxvk {
     HANDLE_EXT(extTransformFeedback);              \
     HANDLE_EXT(extVertexAttributeDivisor);         \
     HANDLE_EXT(khrDeviceFault);                    \
+    HANDLE_EXT(khrFragmentShadingRate);            \
     HANDLE_EXT(khrDynamicRenderingLocalRead);      \
     HANDLE_EXT(khrExternalMemoryWin32);            \
     HANDLE_EXT(khrExternalSemaphoreWin32);         \
@@ -78,6 +89,7 @@ namespace dxvk {
     HANDLE_EXT(nvxImageViewHandle);
 
   #define EXTENSIONS_WITH_PROPERTIES               \
+    HANDLE_EXT(khrAccelerationStructure);          \
     HANDLE_EXT(extConservativeRasterization);      \
     HANDLE_EXT(extCustomBorderColor);              \
     HANDLE_EXT(extDescriptorBuffer);               \
@@ -91,6 +103,7 @@ namespace dxvk {
     HANDLE_EXT(extTransformFeedback);              \
     HANDLE_EXT(extVertexAttributeDivisor);         \
     HANDLE_EXT(khrDeviceFault);                    \
+    HANDLE_EXT(khrFragmentShadingRate);            \
     HANDLE_EXT(khrMaintenance5);                   \
     HANDLE_EXT(khrMaintenance6);                   \
     HANDLE_EXT(khrMaintenance7);                   \
@@ -619,6 +632,51 @@ namespace dxvk {
      && !m_featuresSupported.khrPresentId2.presentId2)
       m_featuresSupported.nvLowLatency2 = VK_FALSE;
 
+    // blessed: ray query + acceleration structure build inputs.
+    // Requires deferred host operations (the extension it depends on) as well
+    // as the actual accelerationStructure/rayQuery feature bits.
+    {
+      bool hwSupported = m_featuresSupported.khrDeferredHostOperations
+                       && m_featuresSupported.khrAccelerationStructure.accelerationStructure
+                       && m_featuresSupported.khrRayQuery.rayQuery;
+
+      bool enableRayQuery = instance.options().enableRayQuery;
+
+      if (env::getEnvVar("BLESSED_RT") == "0")
+        enableRayQuery = false;
+
+      if (!hwSupported || !enableRayQuery) {
+        m_featuresSupported.khrDeferredHostOperations = VK_FALSE;
+        m_featuresSupported.khrAccelerationStructure.accelerationStructure = VK_FALSE;
+        m_featuresSupported.khrRayQuery.rayQuery = VK_FALSE;
+
+        Logger::info(str::format("blessed: ray query unavailable (",
+          !hwSupported ? "gpu or driver lacks acceleration structure / ray query support"
+                       : "disabled via dxvk.enableRayQuery or BLESSED_RT=0", ")"));
+      } else {
+        Logger::info("blessed: ray query enabled");
+      }
+    }
+
+    // blessed: vrs -- the extension stays off unless BLESSED_VRS names a
+    // mode and the device has both pipeline and attachment rates.
+    // Primitive rates are never used.
+    {
+      bool hwSupported = m_featuresSupported.khrFragmentShadingRate.pipelineFragmentShadingRate
+                      && m_featuresSupported.khrFragmentShadingRate.attachmentFragmentShadingRate;
+      bool requested = BlessedVrs::mode() != BlessedVrsMode::Off;
+
+      if (!hwSupported || !requested) {
+        m_featuresSupported.khrFragmentShadingRate.pipelineFragmentShadingRate = VK_FALSE;
+        m_featuresSupported.khrFragmentShadingRate.attachmentFragmentShadingRate = VK_FALSE;
+
+        if (requested)
+          Logger::warn("blessed: vrs: device lacks pipeline + attachment fragment shading rate, BLESSED_VRS ignored");
+      }
+
+      m_featuresSupported.khrFragmentShadingRate.primitiveFragmentShadingRate = VK_FALSE;
+    }
+
     // Disable debug extensions if hang debugging is disabled
     if (!instance.debugFlags().test(DxvkDebugFlag::Hang)) {
       m_featuresSupported.khrDeviceFault.deviceFault = VK_FALSE;
@@ -682,6 +740,11 @@ namespace dxvk {
     if (m_queueMapping.transfer.family == VK_QUEUE_FAMILY_IGNORED)
       m_queueMapping.transfer.family = computeQueue;
 
+    // blessed: gpu-gaps -- BLESSED_NO_TRANSFER_QUEUE=1 keeps dxvk's uploads
+    // on the graphics queue: no transfer submits, no cross-queue waits
+    if (unlikely(BlessedGpuGaps::NoTransferQueue()))
+      m_queueMapping.transfer = m_queueMapping.graphics;
+
     // Prefer using the graphics queue as a sparse binding queue if possible
     auto& graphicsQueue = m_queuesAvailable[m_queueMapping.graphics.family].core;
 
@@ -693,10 +756,21 @@ namespace dxvk {
         VK_QUEUE_SPARSE_BINDING_BIT);
     }
 
+    // blessed: async-compute -- one extra queue, only when asked for
+    if (unlikely(BlessedAsync::IsRequested()))
+      blessedPickAsyncQueue();
+
+    // blessed: present-idle -- a spare graphics-family queue for presents
+    if (unlikely(BlessedPresent::Mode() == BlessedPresentMode::Queue))
+      blessedPickPresentQueue();
+
     // Actually enable all the queues
     enableQueue(m_queueMapping.graphics);
     enableQueue(m_queueMapping.transfer);
     enableQueue(m_queueMapping.sparse);
+    enableQueue(m_queueMapping.blessedCompute); // blessed: async-compute, no-op when unset
+    enableQueue(m_queueMapping.blessedVolCompute); // blessed: vol-async-3, no-op when unset
+    enableQueue(m_queueMapping.blessedPresent); // blessed: present-idle, no-op when unset
 
     // Fix up queue priority pointers
     uint32_t maxQueueCount = 0u;
@@ -718,7 +792,7 @@ namespace dxvk {
 
     for (auto& q : m_queuesEnabled) {
       if (q.queueFamilyIndex == queue.family) {
-        q.queueCount = queue.index + 1u;
+        q.queueCount = std::max(q.queueCount, queue.index + 1u); // blessed: present-idle, never shrink
         return;
       }
     }
@@ -823,6 +897,13 @@ namespace dxvk {
         require, #name }
 
     return {{
+      /* blessed: ray query + acceleration structure build inputs.
+       * deferred host operations has no feature bits of its own; it is
+       * required by acceleration structure and enabled alongside it. */
+      ENABLE_EXT(khrDeferredHostOperations, false),
+      ENABLE_EXT_FEATURE(khrAccelerationStructure, accelerationStructure, false),
+      ENABLE_EXT_FEATURE(khrRayQuery, rayQuery, false),
+
       ENABLE_FEATURE(core.features, depthBiasClamp, true),
       ENABLE_FEATURE(core.features, depthBounds, false),
       ENABLE_FEATURE(core.features, depthClamp, true),
@@ -902,6 +983,8 @@ namespace dxvk {
       ENABLE_FEATURE(vk12, timelineSemaphore, true),
       ENABLE_FEATURE(vk12, uniformBufferStandardLayout, true),
       ENABLE_FEATURE(vk12, vulkanMemoryModel, true),
+      // blessed: device-scope atomics in the blessed debug counters
+      ENABLE_FEATURE(vk12, vulkanMemoryModelDeviceScope, false),
 
       ENABLE_FEATURE(vk13, inlineUniformBlock, true),
       ENABLE_FEATURE(vk13, computeFullSubgroups, true),
@@ -1016,6 +1099,11 @@ namespace dxvk {
       /* Hang debugging */
       ENABLE_EXT_FEATURE(khrDeviceFault, deviceFault, false),
       ENABLE_EXT_FEATURE(khrDeviceFault, deviceFaultVendorBinary, false),
+
+      // blessed: vrs -- supported only when BLESSED_VRS asks for it, see
+      // the sanitize block in initDeviceProperties
+      ENABLE_EXT_FEATURE(khrFragmentShadingRate, pipelineFragmentShadingRate, false),
+      ENABLE_EXT_FEATURE(khrFragmentShadingRate, attachmentFragmentShadingRate, false),
 
       /* Tiler stuff */
       ENABLE_EXT_FEATURE(khrDynamicRenderingLocalRead, dynamicRenderingLocalRead, false),

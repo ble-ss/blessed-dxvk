@@ -1,0 +1,3 @@
+# the game's own bytecode and everything compiled from it stay out of git
+vanilla/
+out/

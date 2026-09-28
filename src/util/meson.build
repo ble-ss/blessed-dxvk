@@ -1,4 +1,5 @@
 util_src = files([
+  'util_blessed_probe.cpp',
   'util_env.cpp',
   'util_string.cpp',
   'util_fps_limiter.cpp',

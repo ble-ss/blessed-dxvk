@@ -14,6 +14,35 @@
 
 namespace dxvk {
 
+  // blessed: scene capture, defined in blessed/blessed_scene.h -- forward
+  // declared here so this header (included nearly everywhere) doesn't have
+  // to pull in the whole scene-capture cache machinery.
+  struct BlessedSceneDraw;
+
+  // blessed: actor-skinning, same file/reasoning as BlessedSceneDraw above.
+  struct BlessedSceneSkinBatch; // blessed: hook-cpu-2
+
+  // blessed: sun shadow pass, defined in blessed/blessed_shadow.h -- same
+  // reasoning, kept out of this header's own includes.
+  struct BlessedShadowDispatchArgs;
+  struct BlessedPointShadowDispatchArgs; // blessed: point-lights
+  struct BlessedAoDispatchArgs; // blessed: rtao, blessed/blessed_ao.h
+  struct BlessedVolDispatchArgs; // blessed: volumetrics, blessed/blessed_volumetrics.h
+  struct BlessedCascadeBoundsArgs; // blessed: cascade-cache, blessed/blessed_cascade_cache.h
+
+  // blessed: cb-ring, defined in blessed/blessed_cb_ring.h
+  struct DxvkBlessedCbRename;
+
+  // blessed: gi probe grid, defined in blessed/blessed_gi.h -- same
+  // reasoning, kept out of this header's own includes.
+  struct BlessedGiFrameLighting;
+
+  // blessed: gi v1, same file -- one mesh's diffuse texture + geometry
+  // identity, handed app-thread -> cs-thread the same way as the above.
+  struct BlessedGiMeshAlbedoNote;
+  class  BlessedGiState; // blessed: gi-cs
+  class  BlessedVrsState; // blessed: vrs, blessed/blessed_vrs.h
+
   /**
    * \brief DXVK context
    * 
@@ -147,6 +176,10 @@ namespace dxvk {
             DxvkRenderTargets&&   targets,
             VkImageAspectFlags    feedbackLoop) {
       if (likely(m_state.om.renderTargets != targets)) {
+        // blessed: vrs -- the lit pass may have just ended
+        if (unlikely(m_blessedVrs))
+          blessedVrsTargetsChanged(targets);
+
         m_state.om.renderTargets = std::move(targets);
         m_flags.set(DxvkContextFlag::GpDirtyRenderTargets);
       }
@@ -892,6 +925,33 @@ namespace dxvk {
       const Rc<DxvkBuffer>&           buffer,
             Rc<DxvkResourceAllocation>&& slice);
 
+    // blessed: cb-ring -- invalidateBuffer for a batch of uniform-only
+    // buffers, each renamed onto a chunk of the ring \p block, in order.
+    // \p mirror is \p block's vram mirror (null unless d3d11.blessedCbMirror
+    // is on): entries not read on the cpu are renamed onto it instead, and
+    // the range touched is queued for blessedFlushCbMirror to copy in.
+    // See src/dxvk/blessed/blessed_cb_ring.cpp.
+    void blessedRenameBuffers(
+      const Rc<DxvkResourceAllocation>& block,
+      const Rc<DxvkResourceAllocation>& mirror,
+      const DxvkBlessedCbRename*        entries,
+            size_t                    count);
+
+    // blessed: cb-mirror -- copies every ring block's byte range written
+    // since the last submission to its vram mirror, on the transfer queue.
+    // Called once per submission, from flushCommandList. No-op (one empty
+    // check) whenever d3d11.blessedCbMirror is off. See
+    // src/dxvk/blessed/blessed_cb_mirror.cpp.
+    void blessedFlushCbMirror();
+
+    // blessed: cb-mirror -- the same, plus splitCommands right after, so
+    // the copy's transfer-queue submission gets a head start on whatever
+    // graphics work is recorded next, instead of landing in the same
+    // submission as the draws that wait on it. Called when a ring block
+    // retires (D3D11ImmediateContext::BlessedFlushCbMirrorEarly), not on
+    // every submission -- see its own comment for why.
+    void blessedFlushCbMirrorEarly();
+
     /**
      * \brief Ensures that buffer will not be relocated
      *
@@ -903,6 +963,159 @@ namespace dxvk {
      */
     void ensureBufferAddress(
       const Rc<DxvkBuffer>&           buffer);
+
+    /**
+     * \brief Runs the blessed rt selftest: blas + tlas + ray query + readback
+     *
+     * Self-contained: records into this context's current command list,
+     * ends recording, submits, waits for the device to go idle, reads the
+     * result back, and logs a pass/fail line. See src/dxvk/blessed/blessed_rt.h.
+     * Only ever called once, from \c BlessedRt::runSelfTestOnce, on a
+     * throwaway context created just for this.
+     */
+    void blessedRunSelfTest();
+
+    /**
+     * \brief Caches/queues a blas for one captured draw and appends an instance
+     *
+     * No-op if scene capture was never enabled (\c m_device->blessedScene()
+     * is \c nullptr) -- one cached-pointer branch. See
+     * src/dxvk/blessed/blessed_scene.h for what this actually does.
+     */
+    void blessedSceneAddDraw(
+      const BlessedSceneDraw&           draw);
+
+    /**
+     * \brief Builds this frame's queued blases and tlas
+     *
+     * Emitted once per frame from \c D3D11SwapChain::Present, before the
+     * present flush. No-op if scene capture was never enabled.
+     * \p skinnedPass: the depth-only pass before the mask draw (0 = none
+     * seen), see BlessedScene::endFrame. // blessed: skin-v2
+     * \p skinBatch: the frame's staged skinned draws, recycled after use
+     * (may be null). // blessed: hook-cpu-2
+     */
+    void blessedSceneEndFrame(uint32_t skinnedPass,
+      std::unique_ptr<BlessedSceneSkinBatch> skinBatch);
+
+    /**
+     * \brief Dispatches the ray-traced sun shadow pass for one draw
+     *
+     * No-op if the device lacks ray query support or \p args flags the
+     * output image as not storage-capable. Records into this context's
+     * current command list -- called from the immediate context's post-draw
+     * hook (BLESSED_HOOK_MODE=rtshadow), never on a throwaway context, since
+     * it must land in the same command stream as the draw whose depth/rtv
+     * it reads. See src/dxvk/blessed/blessed_shadow.h.
+     */
+    void blessedRunShadowPass(
+      const BlessedShadowDispatchArgs& args);
+
+    // blessed: point-lights -- one light's traced shadow into its mask
+    // channel(s). See src/dxvk/blessed/blessed_point_shadow.h.
+    void blessedRunPointShadowPass(
+      const BlessedPointShadowDispatchArgs& args);
+    // blessed: rtao -- traced ao into the sao texture, right before the
+    // sao composite draw. See src/dxvk/blessed/blessed_ao.h.
+    void blessedRunAoPass(
+      const BlessedAoDispatchArgs& args);
+    // blessed: volumetrics -- runs after pass 138's draw, same stream rules
+    // as blessedRunShadowPass. See src/dxvk/blessed/blessed_volumetrics.h.
+    void blessedRunVolumetricsPass(
+      const BlessedVolDispatchArgs& args);
+    // blessed: cascade-cache -- per-mesh bounds for the partial restore,
+    // read from the game's own buffers. See blessed/blessed_cascade_cache.h.
+    void blessedRunCascadeBounds(
+      const BlessedCascadeBoundsArgs& args);
+
+    /**
+     * \brief Hands one frame's pre-zero ambient/sun reading to the gi probe tracer
+     *
+     * No-op if BLESSED_GI=probes was never enabled (\c m_device->blessedGi()
+     * is \c nullptr). See src/dxvk/blessed/blessed_gi.h.
+     */
+    void blessedGiNoteLighting(
+      const BlessedGiFrameLighting&    lighting);
+
+    /**
+     * \brief Traces the gi probe grid for this frame
+     *
+     * Emitted once per frame from \c D3D11SwapChain::Present, in the same
+     * ordered cs chunk as \ref blessedSceneEndFrame and right after it, so
+     * this frame's scene tlas is already current. No-op if BLESSED_GI=probes
+     * was never enabled. See src/dxvk/blessed/blessed_gi.h.
+     */
+    void blessedRunGiTrace();
+
+    /**
+     * \brief Gi v1: hands one mesh's resolved diffuse texture to the albedo table
+     *
+     * No-op if BLESSED_GI=probes was never enabled or scene capture never
+     * ran (either \c m_device->blessedGi() or \c blessedScene() is
+     * \c nullptr). Never records gpu work itself -- see
+     * \c BlessedGiState::ensureAlbedo's doc comment on why (this may run mid
+     * the game's own render pass). See src/dxvk/blessed/blessed_gi.h.
+     */
+    void blessedGiNoteMeshAlbedo(
+      const BlessedGiMeshAlbedoNote&    note);
+
+    // blessed: gi-cs -- the uniform buffer slice bound at \p slot right now
+    // (cs thread), so the gi ambient patch can read and write the bound
+    // allocation's host mapping just before a draw is recorded.
+    const DxvkBufferSlice& blessedUniformBuffer(uint32_t slot) const {
+      return m_uniformBuffers[slot];
+    }
+
+    // blessed: scene-cs -- the vertex/index buffers bound right now (cs
+    // thread), for scene capture's per-draw read just before recording.
+    const DxvkBufferSlice& blessedVertexBuffer(uint32_t binding) const {
+      return m_state.vi.vertexBuffers[binding];
+    }
+
+    uint32_t blessedVertexStride(uint32_t binding) const {
+      return m_state.vi.vertexStrides[binding];
+    }
+
+    const DxvkBufferSlice& blessedIndexBuffer() const {
+      return m_state.vi.indexBuffer;
+    }
+
+    VkIndexType blessedIndexType() const {
+      return m_state.vi.indexType;
+    }
+
+    // blessed: gi-cs -- null unless BLESSED_GI=probes created the state.
+    BlessedGiState* blessedGi() const;
+
+    // blessed: async-compute -- see src/dxvk/blessed/blessed_async.h.
+    // true when BLESSED_ASYNC=1 got a second queue (one cached-pointer test)
+    bool blessedAsyncAvailable() const;
+    // starts recording into the async queue's buffer: ends the render
+    // pass, splits the graphics commands, swaps the exec buffer
+    void blessedAsyncBegin();
+    // ends it and records the kick
+    void blessedAsyncEnd();
+    // graphics work recorded after this waits for every kick so far; a
+    // no-op (one bool test) when no kick is outstanding
+    void blessedAsyncSync();
+
+    // blessed: vanilla-vol-async -- see src/d3d11/blessed_vol_async.h.
+    // Same as blessedAsyncBegin(), but only for the same-family queue (the
+    // images vanilla's own volumetric compute touches were never tagged
+    // concurrent across queue families): a no-op, returning false, when the
+    // async queue is unavailable or is a different family. Returns true
+    // when it actually began.
+    bool blessedVolAsyncBegin();
+    // ends it, only if blessedVolAsyncBegin() returned true and this has
+    // not run since; safe to call unconditionally.
+    void blessedVolAsyncEnd();
+    // blessed: vol-async-3 -- BLESSED_VOL_ASYNC=2: moves the rest of the
+    // open window (the chain) to a compute-family kick of its own, with
+    // ownership transfers on the two froxel volumes. False (and nothing
+    // changes) when there is no such queue or the window is not open.
+    bool blessedVolAsyncSwitch(
+      const Rc<DxvkImage>&            vol0,
+      const Rc<DxvkImage>&            vol1);
 
     /**
      * \brief Invalidates image content
@@ -1340,9 +1553,49 @@ namespace dxvk {
     std::pair<uint64_t, uint64_t> m_framesToCapture = {};
 
     uint64_t                m_trackingId = 0u;
+
+    DxvkBlessedLayerStats   m_blessedLayerStats = { }; // blessed: perlayer
+    bool                    m_blessedAsyncPending = false; // blessed: async-compute
+    bool                    m_blessedVolAsyncActive = false; // blessed: vanilla-vol-async
+    // blessed: vol-async-3 -- how often the readiness fix's two halves ran
+    struct {
+      uint32_t windows = 0u;
+      uint32_t pending = 0u;
+      uint32_t hostRenames = 0u;
+      uint32_t chainKicks = 0u; // =2: windows whose chain ran on the compute family
+      uint32_t cutByFlush = 0u; // windows a flush ended early
+    } m_blessedVolStats;
+
+    // blessed: vol-async-3 -- BLESSED_VOL_ASYNC=2's ownership state
+    bool                    m_blessedVolOnCompute = false;
+    bool                    m_blessedVolNeedsAcquire = false;
+    std::array<Rc<DxvkImage>, 2> m_blessedVolImages;
+
+    void blessedVolOwnership(bool release, bool toCompute);
+
+    void blessedVolAcquireIfPending();
     uint64_t                m_submitWaitId = 0u;
     uint64_t                m_submitLastId = 0u;
     Rc<DxvkFence>           m_trackingFence;
+
+    // blessed: cb-mirror -- one ring block's dirty range since the last
+    // submission, pending the host -> mirror copy. Almost always 0-2
+    // entries live; a linear scan to find a block already in the list is
+    // cheaper than a map at this size. See blessed_cb_mirror.cpp.
+    struct BlessedCbMirrorRange {
+      Rc<DxvkResourceAllocation> block;
+      Rc<DxvkResourceAllocation> mirror;
+      VkDeviceSize               lo = 0u;
+      VkDeviceSize               hi = 0u;
+    };
+
+    std::vector<BlessedCbMirrorRange> m_blessedCbMirrorPending;
+
+    void blessedTrackCbMirrorDirty(
+      const Rc<DxvkResourceAllocation>& block,
+      const Rc<DxvkResourceAllocation>& mirror,
+            VkDeviceSize                lo,
+            VkDeviceSize                hi);
 
     uint32_t                m_renderPassIndex = 0u;
     uint32_t                m_unsynchronizedDrawCount = 0u;
@@ -1406,6 +1659,26 @@ namespace dxvk {
     bool                    m_endLatencyTracking = false;
 
     DxvkImplicitResolveTracker  m_implicitResolves;
+
+    // blessed: vrs -- null unless the device enabled fragment shading
+    // rate (BLESSED_VRS). Owned; see src/dxvk/blessed/blessed_vrs.cpp.
+    BlessedVrsState*            m_blessedVrs = nullptr;
+
+    void blessedVrsCreate();
+    void blessedVrsDestroy();
+    // top of beginRenderPass, outside any render pass: matches the new
+    // framebuffer, and runs the rate analysis when the lit pass just ended
+    void blessedVrsPrePass();
+    void blessedVrsAllocate(VkExtent2D tiles);
+    // bindRenderTargets: runs the end-of-lit-pass work when the lit pass's
+    // colour and motion are no longer bound
+    void blessedVrsTargetsChanged(const DxvkRenderTargets& targets);
+    // the analysis (adaptive) and the debug tint, after the lit pass
+    void blessedVrsEndOfLitPass();
+    // chains the rate attachment into a matched pass's VkRenderingInfo
+    void blessedVrsBeginRendering(VkRenderingInfo& renderingInfo);
+    // per draw: sets the combiner when the pass or the pixel shader changed
+    void blessedVrsUpdateDraw();
 
     void blitImageFb(
             Rc<DxvkImageView>     dstView,
@@ -2185,6 +2458,20 @@ namespace dxvk {
 
     bool prepareOutOfOrderTransition(
             DxvkImage&                image);
+
+    // blessed: perlayer -- see blessed/blessed_layer_tracking.cpp
+    bool blessedLayerTransitionOutOfOrder(
+      const DxvkImageView&            view);
+
+    DxvkBlessedLayerSnapshot blessedSnapshotAttachmentLayers(
+      const DxvkFramebufferInfo&      framebufferInfo);
+
+    void blessedRestoreAttachmentLayers(
+      const DxvkFramebufferInfo&      framebufferInfo,
+      const DxvkBlessedLayerSnapshot& snapshot);
+
+    void blessedCountLayerPass(
+            DxvkCmdBuffer             cmdBuffer);
 
     template<VkPipelineBindPoint BindPoint, typename Pred>
     bool checkResourceBarrier(

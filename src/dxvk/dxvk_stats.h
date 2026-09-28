@@ -30,6 +30,7 @@ namespace dxvk {
     CsSyncTicks,              ///< Time spent waiting on CS
     CsIdleTicks,              ///< CS thread idle time in microseconds
     CsChunkCount,             ///< Submitted CS chunks
+    CsChunkCmdCount,          ///< blessed: commands executed across submitted CS chunks
     DescriptorPoolCount,      ///< Descriptor pool count
     DescriptorSetCount,       ///< Descriptor sets allocated
     DescriptorHeapCount,      ///< Number of descriptor heaps created

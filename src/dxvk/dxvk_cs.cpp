@@ -17,17 +17,19 @@ namespace dxvk {
   }
 
 
-  void DxvkCsChunk::executeAll(DxvkContext* ctx) {
+  uint32_t DxvkCsChunk::executeAll(DxvkContext* ctx) {
     auto cmd = m_head;
-    
+    uint32_t count = 0; // blessed: command count for the probe seat
+
     if (m_flags.test(DxvkCsChunkFlag::SingleUse)) {
       m_commandOffset = 0;
-      
+
       while (cmd != nullptr) {
         auto next = cmd->next();
         cmd->exec(ctx);
         cmd->~DxvkCsCmd();
         cmd = next;
+        count++;
       }
 
       m_head = nullptr;
@@ -36,8 +38,11 @@ namespace dxvk {
       while (cmd != nullptr) {
         cmd->exec(ctx);
         cmd = cmd->next();
+        count++;
       }
     }
+
+    return count;
   }
   
   
@@ -247,7 +252,9 @@ namespace dxvk {
 
           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
 
-          entry.chunk->executeAll(m_context.ptr());
+          // blessed: feed the probe seat's per-window command count
+          uint32_t cmdCount = entry.chunk->executeAll(m_context.ptr());
+          m_context->addStatCtr(DxvkStatCounter::CsChunkCmdCount, cmdCount);
 
           if (entry.seq) {
             // Use a separate mutex for the chunk counter, this will only

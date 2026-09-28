@@ -371,6 +371,16 @@ namespace dxvk::vk {
     VULKAN_FN(vkCmdEndConditionalRenderingEXT);
     #endif
 
+    // blessed: ray query / acceleration structure build support
+    #ifdef VK_KHR_acceleration_structure
+    VULKAN_FN(vkCreateAccelerationStructureKHR);
+    VULKAN_FN(vkDestroyAccelerationStructureKHR);
+    VULKAN_FN(vkGetAccelerationStructureBuildSizesKHR);
+    VULKAN_FN(vkCmdBuildAccelerationStructuresKHR);
+    VULKAN_FN(vkGetAccelerationStructureDeviceAddressKHR);
+    VULKAN_FN(vkCmdWriteAccelerationStructuresPropertiesKHR);
+    #endif
+
     #ifdef VK_EXT_descriptor_buffer
     VULKAN_FN(vkGetDescriptorSetLayoutSizeEXT);
     VULKAN_FN(vkGetDescriptorSetLayoutBindingOffsetEXT);
@@ -422,6 +432,11 @@ namespace dxvk::vk {
     VULKAN_FN(vkCmdSetDepthClipEnableEXT);
     VULKAN_FN(vkCmdSetSampleLocationsEnableEXT);
     VULKAN_FN(vkCmdSetLineRasterizationModeEXT);
+    #endif
+
+    // blessed: vrs -- per-draw combiner, BLESSED_VRS only
+    #ifdef VK_KHR_fragment_shading_rate
+    VULKAN_FN(vkCmdSetFragmentShadingRateKHR);
     #endif
 
     #ifdef VK_EXT_full_screen_exclusive

@@ -87,6 +87,12 @@ namespace dxvk {
       return m_buffer;
     }
 
+    // blessed: perf-halfrate -- the same without the Rc copy (two locked
+    // ops) for the per-map ring path; the D3D11Buffer keeps it alive
+    DxvkBuffer* BlessedBufferPtr() const {
+      return m_buffer.ptr();
+    }
+
     Rc<DxvkSparsePageAllocator> GetSparseAllocator() const {
       return m_sparseAllocator;
     }
@@ -126,11 +132,80 @@ namespace dxvk {
     Rc<DxvkResourceAllocation> DiscardSlice(DxvkLocalAllocationCache* cache) {
       auto allocation = m_buffer->allocateStorage(cache);
       m_mapPtr = allocation->mapPtr();
+
+      // blessed: hook-cpu-2 -- see BlessedMappedAllocation
+      if (unlikely(m_blessedKeepAllocation))
+        m_blessedAllocation = allocation;
+
       return allocation;
+    }
+
+    /**
+     * \brief blessed: hook-cpu-2 -- the allocation GetMapPtr points into
+     *
+     * App thread. Kept only for buffers shaped like the skinned bones
+     * cbuffer (dynamic cbuffer, 3,840 bytes, BLESSED_SCENE_SKINNED=1), so
+     * scene capture can hand the gpu the bytes a draw saw without reading
+     * them on the cpu; null for every other buffer.
+     */
+    const Rc<DxvkResourceAllocation>& BlessedMappedAllocation() const {
+      return m_blessedAllocation;
     }
 
     void* GetMapPtr() const {
       return m_mapPtr;
+    }
+
+    /**
+     * \brief blessed: cb-ring -- whether WRITE_DISCARD maps use the ring
+     *
+     * Decided once at creation: d3d11.blessedCbRing is set, and this is
+     * a dynamic, write-only, constant-buffer-only buffer in cached host
+     * memory, small enough for a ring chunk, and not one whose allocation
+     * scene capture keeps (BlessedMappedAllocation).
+     */
+    bool BlessedUsesCbRing() const {
+      return m_blessedCbRing;
+    }
+
+    /**
+     * \brief blessed: cb-ring -- points GetMapPtr at a ring chunk
+     *
+     * App thread, immediate context only, called by the ring map path
+     * in place of DiscardSlice.
+     */
+    void BlessedSetMapPtr(void* mapPtr) {
+      m_mapPtr = mapPtr;
+    }
+
+    /**
+     * rief blessed: threaded-fe -- the app side of the map state
+     *
+     * With the threaded front end, the game thread renames a buffer on
+     * Map(WRITE_DISCARD) long before the front end replays that rename.
+     * The game side answers maps from this pointer; GetMapPtr (and the
+     * kept allocation) stay the replay side, set when the rename record
+     * replays, so every draw-time reader sees the slice its draw saw.
+     * Game thread only. Equal to GetMapPtr whenever the ring is empty.
+     */
+    void* BlessedAppMapPtr() const {
+      return m_blessedAppMapPtr;
+    }
+
+    void BlessedSetAppMapPtr(void* mapPtr) {
+      m_blessedAppMapPtr = mapPtr;
+    }
+
+    /**
+     * rief blessed: threaded-fe -- replay half of a game-side discard
+     *
+     * Front end only: what DiscardSlice does to the replay side.
+     */
+    void BlessedReplayRename(const Rc<DxvkResourceAllocation>& allocation) {
+      m_mapPtr = allocation->mapPtr();
+
+      if (unlikely(m_blessedKeepAllocation))
+        m_blessedAllocation = allocation;
     }
 
     D3D10Buffer* GetD3D10Iface() {
@@ -196,6 +271,20 @@ namespace dxvk {
     uint64_t                      m_seq = 0ull;
 
     void*                         m_mapPtr = nullptr;
+
+    // blessed: hook-cpu-2 -- see BlessedMappedAllocation
+    bool                          m_blessedKeepAllocation = false;
+    Rc<DxvkResourceAllocation>    m_blessedAllocation;
+
+    // blessed: threaded-fe-2 -- the game side's map state on a line of its
+    // own: the front end writes m_mapPtr (and the refcounts) on replay,
+    // and each map would otherwise pull the line back across cores
+    // blessed: threaded-fe -- see BlessedAppMapPtr
+    alignas(CACHE_LINE_SIZE)
+    void*                         m_blessedAppMapPtr = nullptr;
+
+    // blessed: cb-ring -- see BlessedUsesCbRing
+    bool                          m_blessedCbRing = false;
 
     D3D11DXGIResource             m_resource;
     D3D10Buffer                   m_d3d10;

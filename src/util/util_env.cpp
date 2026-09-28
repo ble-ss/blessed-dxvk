@@ -1,4 +1,6 @@
+#include <algorithm> // blessed: crash-log
 #include <array>
+#include <atomic> // blessed: crash-log
 #include <cstdlib>
 #include <filesystem>
 #include <numeric>
@@ -117,8 +119,52 @@ namespace dxvk::env {
   }
   
   
+  // blessed: crash-log -- see blessedRecordThreadName
+  namespace {
+    struct BlessedThreadNameEntry {
+      std::atomic<uint32_t> tid = { 0u };
+      char                  name[24] = { };
+    };
+
+    std::array<BlessedThreadNameEntry, 64> g_blessedThreadNames;
+    std::atomic<uint32_t>                  g_blessedThreadNameCount = { 0u };
+  }
+
+
+  void blessedRecordThreadName(uint32_t tid, const char* name) {
+    uint32_t i = g_blessedThreadNameCount.fetch_add(1u, std::memory_order_relaxed);
+    if (i >= g_blessedThreadNames.size())
+      return;
+
+    auto& e = g_blessedThreadNames[i];
+    size_t n = 0;
+    while (name[n] && n + 1 < sizeof(e.name)) {
+      e.name[n] = name[n];
+      n++;
+    }
+    e.name[n] = '\0';
+    e.tid.store(tid, std::memory_order_release);
+  }
+
+
+  const char* blessedThreadName(uint32_t tid) {
+    uint32_t count = std::min<uint32_t>(g_blessedThreadNameCount.load(std::memory_order_acquire),
+      uint32_t(g_blessedThreadNames.size()));
+
+    // newest first: a reused thread id takes its latest name
+    for (uint32_t i = count; i > 0; i--) {
+      const auto& e = g_blessedThreadNames[i - 1u];
+      if (e.tid.load(std::memory_order_acquire) == tid)
+        return e.name;
+    }
+
+    return nullptr;
+  }
+
+
   void setThreadName(const std::string& name) {
 #ifdef _WIN32
+    blessedRecordThreadName(uint32_t(::GetCurrentThreadId()), name.c_str()); // blessed: crash-log
     using SetThreadDescriptionProc = HRESULT (WINAPI *) (HANDLE, PCWSTR);
 
     static auto SetThreadDescription = reinterpret_cast<SetThreadDescriptionProc>(

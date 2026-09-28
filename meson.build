@@ -174,6 +174,14 @@ else
   ]
 endif
 
+# blessed: -Dblessed_probe=false compiles the timing probe out entirely
+# (see src/util/util_blessed_probe.h); default keeps today's capability.
+if get_option('blessed_probe')
+  compiler_args += ['-DBLESSED_PROBE_ENABLED=1']
+else
+  compiler_args += ['-DBLESSED_PROBE_ENABLED=0']
+endif
+
 dxbc_spirv = subproject('dxbc-spirv')
 dxbc_spirv_dep = dxbc_spirv.get_variable('dxbc_spv_dep')
 
@@ -204,6 +212,27 @@ glsl_generator = generator(
   output    : [ '@BASENAME@.h' ],
   depfile   : '@BASENAME@.h.d',
   arguments : glsl_args,
+)
+
+# blessed: same as glsl_generator but without -gVS. glslang's debug info
+# emits OpExtInstWithForwardRefsKHR, which trips
+# VUID-RuntimeSpirv-shaderRelaxedExtendedInstruction-10773 /
+# VUID-VkShaderModuleCreateInfo-pCode-08742 on drivers without
+# VK_KHR_shader_relaxed_extended_instruction. Blessed compute shaders are
+# small and not worth debugging via SPIR-V source anyway.
+glsl_args_blessed = [
+  '--quiet',
+  '--target-env', 'vulkan1.3',
+  '--vn', '@BASENAME@',
+  '--depfile', '@DEPFILE@',
+  '@INPUT@',
+  '-o', '@OUTPUT@',
+]
+glsl_generator_blessed = generator(
+  glsl_compiler,
+  output    : [ '@BASENAME@.h' ],
+  depfile   : '@BASENAME@.h.d',
+  arguments : glsl_args_blessed,
 )
 
 dxvk_version = vcs_tag(

@@ -1,0 +1,29 @@
+# shader-replace seat notes (2026-09-23)
+
+- worktree wt/shader-replace from blessed b9893f2e
+- pass 20 (lit, 1290 draws, 0.65 ms): ps b63b3bf7, c4c12180, 8a126307, 18a7b10e (list capped at 4)
+- pass 14 cs ab674eb1 (+1c4ebb62) 0.70 ms; pass 43 cs cf1e1a21 (+dbb99d2e, a0cc1311) 0.23 ms
+- no dxbc dumps exist on E:; vanilla bytecode has to come from shaders011.fxp in the bsa
+- fxc: `C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\fxc.exe` (no dxc on PATH)
+- shaders011.fxp pulled out of the bsa (uncompressed bsa v105, one file); 16044 DXBC blobs, 8057 unique checksums. all 9 target hashes found.
+- b63b3bf7 is a 30-instruction effect ps (1 sample): nothing to cut. pass 20's `ps` list is the first 4 bound, not the hottest.
+- pass 14 = ab674eb1 (generate, 1 dispatch) + 1c4ebb62 x ~90: a ping-pong prefix sum along z, one slice per dispatch. that chain is likely most of pass 14.
+- pass 43 = cf1e1a21 (h blur, 990-thread groups) + dbb99d2e (v blur, 570) + a0cc1311 (max-lum downsample)
+- design calls:
+  - disk cache: replaced shaders and their verify twins SKIP dxvk's disk cache (lookup and add). salting createInfo means changing DxvkShaderOptions (raw-serialised) or the cache format; skipping also means a replacement can never poison a later vanilla run.
+  - twins: vanilla and replacement modules under salted keys (last hash byte xor), so no blessed hook matches a twin draw.
+  - verify at d3d11 api level, replay via a lambda that calls BatchDraw* (below the hooks). diff cs = hlsl compiled by fxc, embedded dxbc header.
+- f3a89840: stage 1 mechanism, build green, no warnings in new files
+- rewrites so far: cf1e1a21 (h blur, 990->480 threads), dbb99d2e (v blur, 570->288 threads); same float op order as vanilla (checked in the disasm)
+- next: offline harness (scratchpad) that loads the built d3d11.dll+dxgi.dll, runs the blurs with vanilla bytes with/without BLESSED_SHADER_REPLACE, dumps outputs, times them with timestamp queries; plus a synthetic ps pair for the draw verify path
+- 112d18cb: tools + blur rewrites. harness numbers (1920x1080 r32f, this gpu): h blur 0.0988 -> 0.0613 ms, v blur 0.0983 -> 0.0634 ms, both bit-identical. verifier proven: cs path bit-identical 3/3; ps path: identical variants 0 diff, a deliberate +0.01 for x>1000 caught exactly (993600 px, first [1000,0,0]).
+- chain harness (1c4ebb62, r32f, ping-pong as the game): 160x90x64 0.181 ms vs one-dispatch collapse 0.030; 256x144x90 0.383 vs 0.099; 320x180x128 0.583 vs 0.218. ~4.3 us per chain dispatch. the collapse needs a dispatch-level skip (not a shader swap). design parked: detect k=1 (first 1c4ebb62 after ab674eb1), run the prefix sum into u0 with storage-precision rounding, fix the other texture by copies (it differs from S only at slice D-1), skip k>=2.
+- LEAD PRIORITY (mid-task): pass 37 (gbuffer-ish, 96 draws, first ps 556a3b73) native 0.094 vs dxvk 0.176 ms. find why, fix first.
+- pass 37 (dump frame 1920, i 11757-12279): 96 draws, 46x 556a3b73 + 20x b924cc3a + 9 others; alpha blend on all 3 rts (rgb mask), read-only d24s8 less-equal, 2 rtv clears, no srv/rtv aliasing. every draw binds ~6.6 vs + 4.4 ps cbuffers, all DYNAMIC; 13 draws use a 4 MiB dynamic vb.
+- dxvk's own app profile for SkyrimSE.exe sets d3d11.cachedDynamicResources = a (upstream 878473ba, issue #5885, a render-thread cpu fix): every dynamic cb/vb/ib lives in host-cached system memory, and the cb ring takes the same memory. the gpu reads them over pcie.
+- pass37.exe micro-bench (harness/pass37.cpp, native vs fork dll, same exe): 96 draws, 5 small + 4x 3840-byte dynamic cbs per draw.
+  - size=0.01 (0.42M px): native 0.082, dxvk cached(a)+ring 0.110, dxvk cbs in vram (vir) 0.091 ms
+  - size=0.0005 (per-draw cost only): native 0.061, dxvk a+ring 0.0645, dxvk vir 0.045 ms
+  - so: with cbs in sysmem dxvk's per-draw gpu cost is native's or worse; in vram it is ~25% under native. fits the "+2.5 us per tiny post pass" too (one draw, cold cb fetch over pcie).
+  - residual (cbs in vram, flat ps): mrt blending with 3 rts is ~8-10 us slower than native at small quads; 1 rt or no blend = native. not explained yet.
+  - ruled out: gpl vs monolithic pipelines (same), shader translation (flat ps shows the same gap), clears (~3 us), mid-pass flush (BLESSED_FLUSH=pass run: pass 37 unchanged 0.177).

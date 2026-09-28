@@ -24,6 +24,42 @@ d3d10_src = [
 d3d11_src = [
   'd3d11_annotation.cpp',
   'd3d11_blend.cpp',
+  'blessed_ao.cpp', # blessed: rtao
+  'blessed_autoinstance.cpp', # blessed: auto-instancing census
+  'blessed_cascades.cpp',
+  'blessed_cascade_cache.cpp', # blessed: cascade-cache
+  'blessed_cascade_bounds.cpp', # blessed: cascade-cache, partial restore
+  'blessed_cb_ring.cpp', # blessed: cb-ring
+  'blessed_dump.cpp',
+  'blessed_gi.cpp',
+  'blessed_flush.cpp', # blessed: gpu-gaps
+  'blessed_flush_pass_end.cpp', # blessed: flush-pass-end, BLESSED_FLUSH_AT_PASS_END
+  'blessed_gpu_passes.cpp', # blessed: gpu-pass-timing
+  'blessed_midframe_split.cpp', # blessed: between-passes, BLESSED_MIDFRAME_SPLIT
+  'blessed_hook.cpp',
+  'blessed_point_shadow.cpp', # blessed: point-lights
+  'blessed_look.cpp', # blessed: look-post
+  'blessed_halfrate.cpp', # blessed: half-rate far field
+  'blessed_reflect_halfrate.cpp', # blessed: refl-harden
+  'blessed_scene_capture.cpp',
+  'blessed_shadow.cpp',
+  'blessed_shader_replace.cpp', # blessed: shader-replace
+  'blessed_dispatch_rewrite.cpp', # blessed: shader-replace, dispatch-size override
+  'blessed_vol_collapse.cpp', # blessed: vol-collapse
+  'blessed_vol_async.cpp', # blessed: vanilla-vol-async
+  'blessed_vol_async_verify.cpp', # blessed: vanilla-vol-async, BLESSED_VOL_ASYNC_VERIFY
+  'blessed_threaded_context.cpp', # blessed: threaded-fe
+  'blessed_threaded_record.cpp', # blessed: threaded-fe
+  'blessed_threaded_present.cpp', # blessed: threaded-fe-2
+  'blessed_threaded_placement.cpp', # blessed: threaded-fe-2
+  'blessed_threaded_forensics.cpp', # blessed: fe-crash-2
+  'blessed_threaded_fe_diag.cpp', # blessed: fe-getters
+  'blessed_vanilla_halfrate.cpp', # blessed: perf-halfrate
+  'blessed_crash_log.cpp', # blessed: crash-log -- std::terminate / abort leave a log line
+  'blessed_skip_replaced.cpp', # blessed: gpu track step 2 -- skip replaced vanilla work
+  'blessed_volumetrics.cpp', # blessed: volumetrics
+  'blessed_vrs.cpp', # blessed: vrs
+  'blessed_zero_copy.cpp', # blessed: zero-copy-present
   'd3d11_buffer.cpp',
   'd3d11_class_linkage.cpp',
   'd3d11_cmdlist.cpp',

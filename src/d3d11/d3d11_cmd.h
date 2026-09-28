@@ -16,6 +16,11 @@ namespace dxvk {
     DrawIndirectIndexed,
     Draw,
     DrawIndexed,
+    BlessedDrawGi,        // blessed: gi-cs, Draw + the gi ambient patch
+    BlessedDrawIndexedGi, // blessed: gi-cs, DrawIndexed + the gi ambient patch
+    BlessedDrawIndexedScene, // blessed: scene-cs, DrawIndexed + scene capture
+    BlessedDrawIndexedGiBounds, // blessed: gi-bounds, DrawIndexed + the bounds-sampled gi patch
+    BlessedCbRename, // blessed: cb-ring, consecutive Map(WRITE_DISCARD) renames onto one ring block
   };
 
 

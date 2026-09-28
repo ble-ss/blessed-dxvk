@@ -1,0 +1,147 @@
+// blessed: BLESSED_LOOK composite -- bless's bloom_grade.fsh: screen bloom, add spill, exposure, grain, grade
+#version 460
+
+#extension GL_EXT_samplerless_texture_functions : require
+
+// blessed: a port of bless-shader's bloom_grade.fsh + include/color_grade.glsl
+// (E:\toki-klak\bless-shader, head 48ae0c9), in its order. The grade's
+// constants are bless's cozy-color-1 preset; every one of them is a push
+// value here so BLESSED_LOOK_* can override it. The optional vignette is
+// rmls-irl's (final.fsh:189-192), off by default, placed before the grade
+// the way irl places it so the lift softens the corners.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D s_src;    // the frame: rtv 0, or a copy of it
+layout(set = 0, binding = 1) uniform texture2D s_bloom;  // half res, blurred
+layout(set = 0, binding = 2) uniform texture2D s_spill;  // quarter res, blurred
+// blessed: always an rgba8 unorm image, copied byte for byte into rtv 0;
+// swapRB stores bgra order when rtv 0 is a bgra8 format
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D s_dst;
+
+layout(push_constant) uniform PushData {
+  ivec2 size;
+  ivec2 bloomSize;
+  ivec2 spillSize;
+  float bloomStrength;   // 0.32
+  float spillStrength;   // 0.35
+  float exposure;        // 1.00
+  float grainStrength;   // 0.03
+  float grainScale;      // 0.60
+  float grainTime;       // floor(seconds * 24), wrapped
+  float shoulderKnee;    // 0.78
+  float shoulderBend;    // 0.80
+  float warmth;          // 0.35
+  float pastel;          // 0.22
+  float splitTone;       // 0.60
+  float saturation;      // 1.06
+  float contrast;        // 0.92
+  float lift;            // 0.035
+  float gradeStrength;   // 1.0
+  float vignette;        // 0 (off)
+  int   debugMode;       // BLESSED_LOOK_DEBUG, see src/d3d11/blessed_look.cpp
+  int   splitX;          // debug split: pixels left of this stay vanilla
+  int   swapRB;          // 1: rtv 0 is bgra8
+} pc;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+vec3 bilinear(texture2D tex, ivec2 size, vec2 uv) {
+  vec2 p = uv * vec2(size) - 0.5;
+  vec2 f = fract(p);
+  ivec2 i = ivec2(floor(p));
+  ivec2 hi = size - 1;
+  vec3 a = texelFetch(tex, clamp(i,               ivec2(0), hi), 0).rgb;
+  vec3 b = texelFetch(tex, clamp(i + ivec2(1, 0), ivec2(0), hi), 0).rgb;
+  vec3 c = texelFetch(tex, clamp(i + ivec2(0, 1), ivec2(0), hi), 0).rgb;
+  vec3 d = texelFetch(tex, clamp(i + ivec2(1, 1), ivec2(0), hi), 0).rgb;
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// color_grade.glsl blessGrade, order load-bearing:
+// shoulder -> warmth -> pastel -> split tone -> saturation -> contrast -> lift
+vec3 blessGrade(vec3 source) {
+  vec3 c = source;
+  c = c / (1.0 + max(c - pc.shoulderKnee, 0.0) * pc.shoulderBend);
+  c *= vec3(1.0 + 0.055 * pc.warmth, 1.0 + 0.012 * pc.warmth, 1.0 - 0.045 * pc.warmth);
+  float l = dot(c, LUMA);
+  c = mix(c, mix(c, vec3(l) * 1.08 + 0.02, 0.5), pc.pastel * (1.0 - smoothstep(0.0, 0.55, l)));
+  vec3 shadowTint = vec3(0.94, 0.96, 1.06);
+  vec3 highTint = vec3(1.05, 1.00, 0.93);
+  c *= mix(vec3(1.0), mix(shadowTint, highTint, smoothstep(0.12, 0.72, l)), pc.splitTone);
+  c = mix(vec3(l), c, pc.saturation);
+  c = (c - 0.5) * pc.contrast + 0.5;
+  c += pc.lift * (1.0 - c);
+  c = clamp(c, 0.0, 1.0);
+  return mix(source, c, pc.gradeStrength);
+}
+
+// color_grade.glsl blessHash: polynomial, no large sine arguments
+float blessHash(vec2 p) {
+  vec3 p3 = fract(p.xyx * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+void store(ivec2 pix, vec3 c, float a) {
+  imageStore(s_dst, pix, pc.swapRB != 0 ? vec4(c.bgr, a) : vec4(c, a));
+}
+
+void main() {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(pix, pc.size)))
+    return;
+
+  vec4 source = texelFetch(s_src, pix, 0);
+
+  // debug 1: solid magenta -- proves where this pass runs
+  if (pc.debugMode == 1) {
+    store(pix, vec3(1.0, 0.0, 1.0), source.a);
+    return;
+  }
+
+  // debug 4: split view, vanilla on the left of splitX, a 2 px seam
+  if (pc.debugMode == 4 && pix.x < pc.splitX) {
+    vec3 c = pix.x >= pc.splitX - 2 ? vec3(0.0) : source.rgb;
+    store(pix, c, source.a);
+    return;
+  }
+
+  vec2 uv = (vec2(pix) + 0.5) / vec2(pc.size);
+  vec3 color = source.rgb;
+
+  vec3 bloom = clamp(bilinear(s_bloom, pc.bloomSize, uv) * pc.bloomStrength, 0.0, 1.0);
+  vec3 spill = bilinear(s_spill, pc.spillSize, uv) * pc.spillStrength;
+
+  // debug 2 / 3: the glow alone, screened / added over black
+  if (pc.debugMode == 2) {
+    store(pix, bloom, source.a);
+    return;
+  }
+  if (pc.debugMode == 3) {
+    store(pix, spill, source.a);
+    return;
+  }
+
+  // debug 5: grade only (no bloom, spill or grain)
+  if (pc.debugMode != 5) {
+    color = 1.0 - (1.0 - color) * (1.0 - bloom);
+    color += spill;
+  }
+
+  color *= pc.exposure;
+
+  // blessGrain: before the grade so the lift catches it, weighted to midtones
+  if (pc.grainStrength > 0.0 && pc.debugMode != 5) {
+    float n = blessHash((vec2(pix) + 0.5) * pc.grainScale + pc.grainTime) - 0.5;
+    float l = dot(color, LUMA);
+    color += n * pc.grainStrength * (4.0 * l * (1.0 - l));
+  }
+
+  if (pc.vignette > 0.0) {
+    vec2 v = (uv - 0.5) * vec2(float(pc.size.x) / max(float(pc.size.y), 1.0), 1.0);
+    color *= 1.0 - pc.vignette * smoothstep(0.30, 0.95, length(v));
+  }
+
+  store(pix, blessGrade(color), source.a);
+}

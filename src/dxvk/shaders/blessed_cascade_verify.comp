@@ -1,0 +1,69 @@
+// blessed: cascade-cache -- verify: counts texels where the cached static depth and this frame's fresh static depth differ
+#version 460
+
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D s_cached;
+layout(set = 0, binding = 1) uniform texture2D s_fresh;
+
+// must match BlessedCascadeVerifyCounters in blessed_cascade_cache.h
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedCascadeCounters {
+  uint differ;
+  uint ghost;
+  uint missing;
+  uint maxDiff;
+};
+
+// must match VerifyPush in blessed_cascade_cache.cpp
+layout(push_constant, scalar) uniform BlessedCascadeVerifyPush {
+  BlessedCascadeCounters counters;
+  uvec2                  size;
+} pc;
+
+shared uint g_differ;
+shared uint g_ghost;
+shared uint g_missing;
+shared uint g_maxDiff;
+
+void main() {
+  if (gl_LocalInvocationIndex == 0u) {
+    g_differ  = 0u;
+    g_ghost   = 0u;
+    g_missing = 0u;
+    g_maxDiff = 0u;
+  }
+
+  barrier();
+
+  uvec2 p = gl_GlobalInvocationID.xy;
+
+  if (all(lessThan(p, pc.size))) {
+    // d16 unorm read back as float: equal stored values give equal floats
+    float cached = texelFetch(s_cached, ivec2(p), 0).r;
+    float fresh  = texelFetch(s_fresh,  ivec2(p), 0).r;
+
+    if (cached != fresh) {
+      atomicAdd(g_differ, 1u);
+
+      if (cached < fresh)
+        atomicAdd(g_ghost, 1u);
+      else
+        atomicAdd(g_missing, 1u);
+
+      atomicMax(g_maxDiff, uint(abs(cached - fresh) * 65535.0f + 0.5f));
+    }
+  }
+
+  barrier();
+
+  if (gl_LocalInvocationIndex == 0u && g_differ != 0u) {
+    atomicAdd(pc.counters.differ,  g_differ);
+    atomicAdd(pc.counters.ghost,   g_ghost);
+    atomicAdd(pc.counters.missing, g_missing);
+    atomicMax(pc.counters.maxDiff, g_maxDiff);
+  }
+}

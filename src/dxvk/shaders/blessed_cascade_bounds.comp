@@ -1,0 +1,150 @@
+// blessed: cascade-cache -- per-mesh bounds for the partial restore: object-space aabb, index range and bones of one draw's index range
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Words {
+  uint w[];
+};
+
+// must match BlessedCascadeBoundsResult in blessed_cascade_cache.h (64 bytes)
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Result {
+  uint minPos[3];   // ordered float bits
+  uint maxPos[3];
+  uint minIndex;
+  uint maxIndex;
+  uint boneMask[3]; // bones with a non-zero weight (80 bits)
+  uint done;
+  uint pad[4];
+};
+
+// must match BlessedCascadeBoundsJob in blessed_cascade_cache.cpp (scalar, 88 bytes)
+struct Job {
+  uint64_t ib;         // byte address of the draw's first index
+  uint64_t pos;        // byte address of vertex 0's position (0: dynamic stream, not read)
+  uint64_t idx;        // byte address of vertex 0's BLENDINDICES (0: not skinned)
+  uint64_t wt;         // byte address of vertex 0's BLENDWEIGHT
+  uint64_t result;
+  uint     index32;    // 1: 32-bit indices
+  uint     indexCount;
+  int      baseVertex;
+  uint     posStride;
+  uint     posFormat;  // 0 rgb32f, 1 rgba32f, 2 rgba16f
+  uint     idxStride;
+  uint     wtStride;
+  uint     firstGroup;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer JobTable {
+  Job jobs[];
+};
+
+layout(push_constant, scalar) uniform BlessedCascadeBoundsPush {
+  JobTable table;
+  uint     jobCount;
+  uint     groupCount;
+} pc;
+
+// one aligned or unaligned 32-bit read at a byte address
+uint readU32(uint64_t addr) {
+  uint64_t base = addr & ~uint64_t(3);
+  uint shift = uint(addr - base) * 8u;
+  Words b = Words(base);
+
+  if (shift == 0u)
+    return b.w[0];
+
+  return (b.w[0] >> shift) | (b.w[1] << (32u - shift));
+}
+
+uint readU16(uint64_t addr) {
+  uint64_t base = addr & ~uint64_t(3);
+  uint shift = uint(addr - base) * 8u;
+  return (Words(base).w[0] >> shift) & 0xffffu;
+}
+
+uint orderedBits(float f) {
+  uint u = floatBitsToUint(f);
+  return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+void main() {
+  uint group = gl_WorkGroupID.x;
+
+  if (group >= pc.groupCount)
+    return;
+
+  // the job whose groups contain this one (jobs are sorted by firstGroup)
+  uint lo = 0u;
+  uint hi = pc.jobCount - 1u;
+
+  while (lo < hi) {
+    uint mid = (lo + hi + 1u) >> 1u;
+
+    if (pc.table.jobs[mid].firstGroup <= group)
+      lo = mid;
+    else
+      hi = mid - 1u;
+  }
+
+  Job j = pc.table.jobs[lo];
+  uint i = (group - j.firstGroup) * 64u + gl_LocalInvocationID.x;
+
+  if (i >= j.indexCount)
+    return;
+
+  uint index = j.index32 != 0u
+    ? readU32(j.ib + uint64_t(i) * 4ul)
+    : readU16(j.ib + uint64_t(i) * 2ul);
+
+  Result r = Result(j.result);
+  atomicMin(r.minIndex, index);
+  atomicMax(r.maxIndex, index);
+
+  int vertex = int(index) + j.baseVertex;
+
+  if (vertex < 0)
+    return;
+
+  uint v = uint(vertex);
+
+  if (j.pos != 0ul) {
+    uint64_t a = j.pos + uint64_t(v) * uint64_t(j.posStride);
+    vec3 p;
+
+    if (j.posFormat == 2u) {
+      vec2 xy = unpackHalf2x16(readU32(a));
+      vec2 zw = unpackHalf2x16(readU32(a + 4ul));
+      p = vec3(xy, zw.x);
+    } else {
+      p = vec3(uintBitsToFloat(readU32(a)), uintBitsToFloat(readU32(a + 4ul)), uintBitsToFloat(readU32(a + 8ul)));
+    }
+
+    for (uint k = 0u; k < 3u; k++) {
+      atomicMin(r.minPos[k], orderedBits(p[k]));
+      atomicMax(r.maxPos[k], orderedBits(p[k]));
+    }
+  }
+
+  if (j.idx != 0ul) {
+    // BLENDINDICES R8G8B8A8_UNORM: the ubyte is the bone; BLENDWEIGHT
+    // R16G16B16A16_SFLOAT: a zero weight's bone is never read by the vs
+    uint bones = readU32(j.idx + uint64_t(v) * uint64_t(j.idxStride));
+    uint64_t wa = j.wt + uint64_t(v) * uint64_t(j.wtStride);
+    vec2 w01 = unpackHalf2x16(readU32(wa));
+    vec2 w23 = unpackHalf2x16(readU32(wa + 4ul));
+    vec4 weight = vec4(w01, w23);
+
+    for (uint k = 0u; k < 4u; k++) {
+      if (weight[k] == 0.0)
+        continue;
+
+      uint bone = min((bones >> (8u * k)) & 0xffu, 79u);
+      atomicOr(r.boneMask[bone >> 5u], 1u << (bone & 31u));
+    }
+  }
+}

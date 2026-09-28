@@ -5,6 +5,15 @@
 #include "dxvk_shader_cache.h"
 #include "dxvk_shader_ir.h"
 
+// blessed: rt plumbing, only instantiated when supportsRayQuery() is true
+#include "blessed/blessed_rt.h"
+// blessed: scene capture, only instantiated when rt is available and a
+// selector env var is set (see BlessedScene::isEnabled)
+#include "blessed/blessed_scene.h"
+// blessed: gi probe grid, only instantiated when rt is available and
+// BLESSED_GI=probes (see BlessedGiState::isEnabled)
+#include "blessed/blessed_gi.h"
+
 namespace dxvk {
   
   DxvkDevice::DxvkDevice(
@@ -40,6 +49,21 @@ namespace dxvk {
 
     if (env::getEnvVar("DXVK_SHADER_CACHE") != "0" && DxvkShader::getShaderDumpPath().empty())
       m_shaderCache = DxvkShaderCache::getInstance();
+
+    // blessed: rt plumbing, created only when the device can actually build
+    // acceleration structures and run ray queries
+    if (supportsRayQuery())
+      m_blessedRt = std::make_unique<BlessedRt>(this);
+
+    // blessed: scene capture is its own opt-in on top of rt support, since
+    // most rt-enabled runs (the selftest, later pass work) don't want it.
+    if (m_blessedRt && BlessedScene::isEnabled())
+      m_blessedScene = std::make_unique<BlessedScene>(this);
+
+    // blessed: gi probe grid is its own opt-in on top of rt support, same
+    // reasoning as scene capture above.
+    if (m_blessedRt && BlessedGiState::isEnabled())
+      m_blessedGi = std::make_unique<BlessedGiState>(this);
 
     logBindingModel();
   }

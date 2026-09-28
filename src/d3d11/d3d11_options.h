@@ -83,6 +83,65 @@ namespace dxvk {
     /// an api trace.
     uint32_t cachedDynamicResources = 0;
 
+    /// blessed: cb-ring -- Map(WRITE_DISCARD) on small dynamic constant
+    /// buffers in cached memory hands out chunks of a persistently mapped
+    /// ring and batches the renames into one cs command. Off by default.
+    bool blessedCbRing = false;
+
+    /// blessed: perf-halfrate -- the ring's blocks in device-local,
+    /// host-visible memory (resizable bar) instead of cached host memory.
+    /// Needs blessedCbRing. Off by default, and a loss on skyrim
+    /// (bis-rebar, -30% fps): every locked instruction after write-combined
+    /// stores waits ~200 ns for them to drain over pcie, and skyrim runs one
+    /// between every cbuffer it writes (scratchpad wcbench, 2026-09-24).
+    bool blessedCbRingDeviceLocal = false;
+
+    /// blessed: cb-mirror -- a device-local mirror of each cached ring
+    /// block. Cbuffer bindings point at the mirror, kept current by a
+    /// transfer-queue copy of the block's written range every submission,
+    /// instead of the cpu writing vram directly (see blessedCbRingDeviceLocal's
+    /// -30%). Needs blessedCbRing. Off by default; see docs/tuning-report.md.
+    bool blessedCbMirror = false;
+
+    /// blessed: traverse-passes -- opts DYNAMIC buffers bound only as a
+    /// vertex and/or index buffer (never also a constant buffer) out of
+    /// cachedDynamicResources's cached-system-memory override, so they keep
+    /// dxvk's own default for a dynamic buffer with bind flags: device-local,
+    /// host-visible (resizable bar). Unlike blessedCbRingDeviceLocal's -30%
+    /// (many small locked writes into write-combined memory), the write
+    /// pattern here is a bulk streaming copy, which write-combined memory is
+    /// built for. Off by default; a lead a/b, not a proven win -- see
+    /// blessed-notes/traverse-passes-notes.md.
+    bool blessedVbRebar = false;
+
+    /// blessed: threaded-fe -- the app gets a recording facade as its
+    /// immediate context, and a front end thread replays into the real
+    /// one. Off by default: the one kill switch.
+    bool blessedThreadedFrontEnd = false;
+
+    /// blessed: threaded-fe -- stage 0: same facade and ring, but the
+    /// recording thread replays itself at every publish. Only read when
+    /// blessedThreadedFrontEnd is set.
+    bool blessedThreadedFrontEndLoopback = false;
+
+    /// blessed: threaded-fe-2 -- stage 2: Present is recorded and runs on
+    /// the front end; off keeps stage 1 (Present drains and runs on the
+    /// game thread). Only read when blessedThreadedFrontEnd is set.
+    bool blessedThreadedPresent = true;
+
+    /// blessed: threaded-fe-2 -- where the front end thread runs: empty
+    /// (the scheduler decides), "auto" (ideal processor on a core other
+    /// than the recording thread's), "auto-mask" (hard affinity to every
+    /// core but that one), "<n>" (ideal logical processor n), or
+    /// "mask:<hex>" (hard affinity mask).
+    std::string blessedFrontEndCpu;
+
+    /// blessed: threaded-fe-2 -- stage 3: redundant binds are not recorded,
+    /// the per-draw sequence packs into draw packets, and publishes come
+    /// every 128 calls instead of after every draw. Only read when
+    /// blessedThreadedFrontEnd is set.
+    bool blessedFrontEndCompact = true;
+
     /// Always lock immediate context on every API call. May be
     /// useful for debugging purposes or when applications have
     /// race conditions.

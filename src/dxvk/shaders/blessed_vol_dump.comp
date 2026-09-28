@@ -1,0 +1,36 @@
+// blessed: BLESSED_VOL_DUMP -- copies pass 138's r16f target into a host-visible float buffer for a one-frame readback
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+layout(set = 1, binding = 0)
+uniform texture2D s_source;
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedVolDumpPixels {
+  float v[];
+};
+
+layout(push_constant, scalar) uniform BlessedVolDumpPush {
+  uint64_t pixelsAddress;
+  uint     width;
+  uint     height;
+  uint     samplerIndex;
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(pc.width) || coord.y >= int(pc.height))
+    return;
+
+  BlessedVolDumpPixels px = BlessedVolDumpPixels(pc.pixelsAddress);
+  px.v[coord.y * int(pc.width) + coord.x] =
+    texelFetch(sampler2D(s_source, s_samplers[pc.samplerIndex]), coord, 0).r;
+}

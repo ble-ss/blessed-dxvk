@@ -1,8 +1,36 @@
 #include <algorithm>
+#include <type_traits>
 
+#include "blessed_ao.h" // blessed: rtao, traced ao before the sao composite draw
+#include "blessed_cascades.h" // blessed: sun shadow cascade learner + skip
+#include "blessed_cascade_cache.h" // blessed: cascade-cache, cached static sun cascades
+#include "blessed_dump.h" // blessed: frame draw-classification dumper
+#include "blessed_gi.h" // blessed: ray-traced gi ambient patch (pre-draw hook)
+#include "blessed_hook.h" // blessed: generic post-draw pixel-shader hook
+#include "blessed_point_shadow.h" // blessed: point-lights
+#include "blessed_look.h" // blessed: look-post
+#include "blessed_scene_capture.h" // blessed: scene-capture selector + config
+#include "blessed_volumetrics.h" // blessed: volumetrics hooks (pass 138, sun mask)
+#include "blessed_vanilla_halfrate.h" // blessed: perf-halfrate
+#include "blessed_skip_replaced.h" // blessed: gpu track step 2 -- skip vanilla work our features replace
+#include "blessed_autoinstance.h" // blessed: auto-instancing census
+#include "blessed_halfrate.h" // blessed: half-rate far field
+#include "blessed_reflect_halfrate.h" // blessed: refl-harden
+#include "blessed_shader_replace.h" // blessed: shader-replace, twin-draw verifier
+#include "blessed_vol_collapse.h" // blessed: vol-collapse
+#include "blessed_vol_async.h" // blessed: vanilla-vol-async
+#include "blessed_dispatch_rewrite.h" // blessed: shader-replace, per-hash dispatch-size override
+#include "blessed_vol_async_verify.h" // blessed: vanilla-vol-async, BLESSED_VOL_ASYNC_VERIFY
+#include "blessed_zero_copy.h" // blessed: zero-copy-present
 #include "d3d11_context.h"
 #include "d3d11_context_def.h"
 #include "d3d11_context_imm.h"
+
+// blessed: render-thread timing probe, see src/util/util_blessed_probe.h
+#include "../util/util_blessed_probe.h"
+
+// blessed: scene capture's cs-thread half (BlessedSceneDraw, DxvkContext::blessedSceneAddDraw)
+#include "../dxvk/blessed/blessed_scene.h"
 
 namespace dxvk {
 
@@ -245,6 +273,7 @@ namespace dxvk {
           ID3D11Resource*                   pSrcResource,
           UINT                              SrcSubresource,
     const D3D11_BOX*                        pSrcBox) {
+    BLESSED_PROBE_CALL(ContextType, CopySubresourceRegion);
     CopySubresourceRegionBase(
       pDstResource, DstSubresource, DstX, DstY, DstZ,
       pSrcResource, SrcSubresource, pSrcBox, 0);
@@ -290,6 +319,14 @@ namespace dxvk {
       || pSrcBox->front >= pSrcBox->back))
       return;
 
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing()))
+        BlessedDump::RecordCopySubresourceRegion(pDstResource, DstSubresource, pSrcResource, SrcSubresource);
+    }
+
     D3D11_RESOURCE_DIMENSION dstResourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     D3D11_RESOURCE_DIMENSION srcResourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
 
@@ -313,6 +350,14 @@ namespace dxvk {
     } else if (dstResourceDim != D3D11_RESOURCE_DIMENSION_BUFFER && srcResourceDim != D3D11_RESOURCE_DIMENSION_BUFFER) {
       auto dstTexture = GetCommonTexture(pDstResource);
       auto srcTexture = GetCommonTexture(pSrcResource);
+
+      // blessed: zero-copy-present -- a copy from or into the back buffer
+      if constexpr (!IsDeferred) {
+        if (unlikely(BlessedZeroCopy::IsEnabled())) {
+          BlessedZeroCopy::OnResourceAccess(GetTypedContext(), pSrcResource, "copy source");
+          BlessedZeroCopy::OnResourceAccess(GetTypedContext(), pDstResource, "copy destination");
+        }
+      }
 
       if (DstSubresource >= dstTexture->CountSubresources()
        || SrcSubresource >= srcTexture->CountSubresources())
@@ -351,10 +396,19 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::CopyResource(
           ID3D11Resource*                   pDstResource,
           ID3D11Resource*                   pSrcResource) {
+    BLESSED_PROBE_CALL(ContextType, CopyResource);
     D3D10DeviceLock lock = LockContext();
 
     if (!pDstResource || !pSrcResource || (pDstResource == pSrcResource))
       return;
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing()))
+        BlessedDump::RecordCopyResource(pDstResource, pSrcResource);
+    }
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
 
     D3D11_RESOURCE_DIMENSION dstResourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     D3D11_RESOURCE_DIMENSION srcResourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
@@ -376,6 +430,14 @@ namespace dxvk {
     } else {
       auto dstTexture = GetCommonTexture(pDstResource);
       auto srcTexture = GetCommonTexture(pSrcResource);
+
+      // blessed: zero-copy-present -- a copy from or into the back buffer
+      if constexpr (!IsDeferred) {
+        if (unlikely(BlessedZeroCopy::IsEnabled())) {
+          BlessedZeroCopy::OnResourceAccess(GetTypedContext(), pSrcResource, "copy source");
+          BlessedZeroCopy::OnResourceAccess(GetTypedContext(), pDstResource, "copy destination");
+        }
+      }
 
       auto dstDesc = dstTexture->Desc();
       auto srcDesc = srcTexture->Desc();
@@ -442,6 +504,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::ClearRenderTargetView(
           ID3D11RenderTargetView*           pRenderTargetView,
     const FLOAT                             ColorRGBA[4]) {
+    BLESSED_PROBE_CALL(ContextType, ClearRenderTargetView);
     D3D10DeviceLock lock = LockContext();
 
     auto rtv = static_cast<D3D11RenderTargetView*>(pRenderTargetView);
@@ -449,11 +512,42 @@ namespace dxvk {
     if (!rtv)
       return;
 
+    // blessed: half-rate far field -- closes the main pass (capture)
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHalfRate::IsWatching())
+       && BlessedHalfRate::OnClearRtv(static_cast<D3D11ImmediateContext*>(this), rtv))
+        return;
+      // blessed: refl-harden -- a skipped water cube face drops its clear
+      if (unlikely(BlessedReflectHalfRate::IsWatching())
+       && BlessedReflectHalfRate::OnClearRtv(rtv))
+        return;
+    }
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing()))
+        BlessedDump::RecordClearRtv(pRenderTargetView, ColorRGBA); // blessed: + clear colour
+    }
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
+
     AddCost(GpuCostEstimate::Transfer);
 
     DxvkAttachment attachment = {};
     attachment.view = rtv->GetImageView();
     attachment.shadow = rtv->GetBufferView();
+
+    // blessed: zero-copy-present -- a clear of the back buffer lands on the
+    // acquired swap chain image (and may be what starts the redirect)
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedZeroCopy::IsEnabled())) {
+        Rc<DxvkImageView> redirect = BlessedZeroCopy::RedirectRenderTarget(
+          GetTypedContext(), attachment.view, true);
+
+        if (redirect != nullptr)
+          attachment.view = std::move(redirect);
+      }
+    }
 
     EmitCs([
       cClearValue = ConvertColorValue(ColorRGBA, attachment.view->formatInfo()),
@@ -478,6 +572,8 @@ namespace dxvk {
 
     if (FAILED(pUnorderedAccessView->QueryInterface(IID_PPV_ARGS(&qiUav))))
       return;
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
 
     AddCost(GpuCostEstimate::Transfer);
 
@@ -631,6 +727,8 @@ namespace dxvk {
     if (!info || info->flags.any(DxvkFormatFlag::SampledSInt, DxvkFormatFlag::SampledUInt))
       return;
 
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
+
     AddCost(GpuCostEstimate::Transfer);
 
     VkClearValue clearValue;
@@ -670,12 +768,41 @@ namespace dxvk {
           UINT                              ClearFlags,
           FLOAT                             Depth,
           UINT8                             Stencil) {
+    BLESSED_PROBE_CALL(ContextType, ClearDepthStencilView);
     D3D10DeviceLock lock = LockContext();
 
     auto dsv = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
 
     if (!dsv)
       return;
+
+    // blessed: half-rate far field -- same as ClearRenderTargetView
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHalfRate::IsWatching())
+       && BlessedHalfRate::OnClearDsv(static_cast<D3D11ImmediateContext*>(this), dsv))
+        return;
+    }
+
+    // blessed: BLESSED_SKIP_CASCADES, immediate context only -- don't even
+    // clear a cascade depth target once the ray-traced mask has replaced
+    // it. See blessed_cascades.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedCascadeSkip::ShouldSkipClear(dsv))) {
+        BlessedCascadeSkip::RecordSkippedClear();
+        return;
+      }
+      if (unlikely(BlessedCascadeCache::IsEnabled()) // blessed: cascade-cache
+       && BlessedCascadeCache::OnClearDsv(static_cast<D3D11ImmediateContext*>(this), dsv, ClearFlags, Depth))
+        return;
+    }
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing()))
+        BlessedDump::RecordClearDsv(pDepthStencilView);
+    }
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
 
     // Figure out which aspects to clear based on
     // the image view properties and clear flags.
@@ -723,6 +850,8 @@ namespace dxvk {
     if (NumRects && !pRect)
       return;
 
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
+
     AddCost(GpuCostEstimate::Transfer);
 
     // ID3D11View has no methods to query the exact type of
@@ -745,6 +874,24 @@ namespace dxvk {
       if (bufView) {
         Logger::err("D3D11: ClearView on buffer RTV not supported.");
         return;
+      }
+
+      // blessed: refl-harden -- a skipped water cube face drops its clear
+      if constexpr (!IsDeferred) {
+        if (unlikely(BlessedReflectHalfRate::IsWatching())
+         && BlessedReflectHalfRate::OnClearRtv(rtv))
+          return;
+      }
+
+      // blessed: zero-copy-present -- same as ClearRenderTargetView
+      if constexpr (!IsDeferred) {
+        if (unlikely(BlessedZeroCopy::IsEnabled()) && imgView != nullptr) {
+          Rc<DxvkImageView> redirect = BlessedZeroCopy::RedirectRenderTarget(
+            GetTypedContext(), imgView, true);
+
+          if (redirect != nullptr)
+            imgView = std::move(redirect);
+        }
       }
 
       if (imgView)
@@ -850,6 +997,16 @@ namespace dxvk {
      || srcResourceType != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
       return;
 
+    BlessedGpuPassEvent(BlessedGpuPassKind::Xfer); // blessed: gpu-pass-timing
+
+    // blessed: zero-copy-present -- a resolve from or into the back buffer
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedZeroCopy::IsEnabled())) {
+        BlessedZeroCopy::OnResourceAccess(GetTypedContext(), pSrcResource, "resolve source");
+        BlessedZeroCopy::OnResourceAccess(GetTypedContext(), pDstResource, "resolve destination");
+      }
+    }
+
     auto dstTexture = static_cast<D3D11Texture2D*>(pDstResource);
     auto srcTexture = static_cast<D3D11Texture2D*>(pSrcResource);
 
@@ -948,6 +1105,7 @@ namespace dxvk {
     const void*                             pSrcData,
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch) {
+    BLESSED_PROBE_CALL(ContextType, UpdateSubresource);
     if (IsDeferred && unlikely(pDstBox != nullptr) && unlikely(!m_parent->GetOptions()->exposeDriverCommandLists)) {
       // If called from a deferred context and native command list support is not
       // exposed, we need to apply the destination box to the source pointer. This
@@ -990,6 +1148,7 @@ namespace dxvk {
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch,
           UINT                              CopyFlags) {
+    BLESSED_PROBE_CALL(ContextType, UpdateSubresource1);
     UpdateResource(pDstResource, DstSubresource, pDstBox,
       pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
   }
@@ -998,6 +1157,20 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::DrawAuto() {
     D3D10DeviceLock lock = LockContext();
+
+    // blessed: vanilla-vol-async -- every draw entry point closes the
+    // window first, if still open. See blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: refl-harden -- a skipped water cube face drops all its draws
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedReflectHalfRate::IsWatching()) // blessed: refl-harden
+       && BlessedReflectHalfRate::OnDraw(m_state))
+        return;
+    }
 
     D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
 
@@ -1009,6 +1182,13 @@ namespace dxvk {
 
     if (!ctrBuf.defined())
       return;
+
+    if constexpr (!IsDeferred) { // blessed: cascade-cache, an indirect or auto draw may end a cascade
+      if (unlikely(BlessedCascadeCache::IsEnabled()))
+        BlessedCascadeCache::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, BlessedCascadeDrawKind::Other, 0u, 0u, 0);
+    }
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Draw); // blessed: gpu-pass-timing
 
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
@@ -1037,10 +1217,118 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::Draw(
           UINT            VertexCount,
           UINT            StartVertexLocation) {
+    BLESSED_PROBE_CALL(ContextType, Draw);
     D3D10DeviceLock lock = LockContext();
 
     if (unlikely(!VertexCount))
       return;
+
+    // blessed: vanilla-vol-async -- every draw entry point closes the
+    // window first, if still open, before anything else. See
+    // blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: half-rate far field -- skip far draws on off frames and
+    // track the main lit pass. See blessed_halfrate.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHalfRate::IsWatching())
+       && BlessedHalfRate::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr()))
+        return;
+      if (unlikely(BlessedReflectHalfRate::IsWatching()) // blessed: refl-harden
+       && BlessedReflectHalfRate::OnDraw(m_state))
+        return;
+    }
+
+    // blessed: BLESSED_SKIP_CASCADES, immediate context only -- a cascade
+    // depth draw is dropped before it ever reaches BatchDraw. See
+    // blessed_cascades.h.
+    if constexpr (!IsDeferred) {
+      // blessed: perf-halfrate -- pass 138 on off frames (BLESSED_VOL_HALFRATE=2).
+      // See blessed_vanilla_halfrate.h.
+      if (unlikely(BlessedVolHalfRate::ShouldSkipDraw(m_state)))
+        return;
+      if (unlikely(BlessedCascadeSkip::ShouldSkipDraw(m_state))) {
+        BlessedCascadeSkip::RecordSkippedDraw();
+        return;
+      }
+      if (unlikely(BlessedCascadeCache::IsEnabled()) && BlessedCascadeCache::OnDraw( // blessed: cascade-cache, never cached
+            static_cast<D3D11ImmediateContext*>(this), m_state, BlessedCascadeDrawKind::Other, 0u, 0u, 0))
+        return;
+      if (unlikely(BlessedPointShadow::ShouldSkipDraw(static_cast<D3D11ImmediateContext*>(this), m_state))) // blessed: point-lights
+        return;
+      // blessed: gpu track step 2 -- skip vanilla work our replacements
+      // already overwrite. See blessed_skip_replaced.h.
+      if (unlikely(BlessedSkipAo::ShouldSkipDraw(m_state))) {
+        BlessedSkipAo::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipVolumetrics::ShouldSkipDraw(m_state))) {
+        BlessedSkipVolumetrics::RecordSkippedDraw();
+        // blessed: vol-2 -- our trace runs from this draw's hook; the
+        // target comes from m_state's bound rtv, so skip only the draw
+        BlessedVolumetrics::OnSkippedDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+      if (unlikely(BlessedSkipBloom::ShouldSkipDraw(m_state))) {
+        BlessedSkipBloom::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipShadowMask::ShouldSkipDraw(m_state))) {
+        BlessedSkipShadowMask::RecordSkipped();
+        // blessed: the raster mask draw is dropped, but our traced shadow
+        // (and the point-light watcher) is launched from this draw's
+        // post-draw hook: run the hooks, skip only the draw itself.
+        if (unlikely(BlessedHook::IsEnabled()))
+          BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedPointShadow::IsEnabled()))
+          BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: vol-2, the sun capture
+          BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+    }
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing())) {
+        BlessedDrawCounts counts;
+        counts.vertexOrIndexCount = VertexCount;
+        counts.startVertexOrIndex = INT(StartVertexLocation);
+        BlessedDump::RecordDraw(m_state, BlessedDumpOp::Draw, counts);
+      }
+      BlessedAutoInstance::OnDraw(m_state, { false, VertexCount, StartVertexLocation, 0, 1u, 0u }); // blessed: auto-instancing census
+    }
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Draw); // blessed: gpu-pass-timing
+
+    // blessed: look-post, pre-draw -- patches the tonemap pass's ps b2
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedLook::IsEnabled()))
+        BlessedLook::OnPreDraw(m_state);
+    }
+
+    // blessed: gi ambient patch, pre-draw -- OnDraw only decides; the patch
+    // itself runs on the cs thread right before the draw is recorded, via
+    // BlessedBatchDraw*Gi (gi-cs, see blessed_gi.h). Immediate context only,
+    // same as the post-draw hooks below.
+    bool blessedGiPatch = false; // blessed: gi-cs, true: patch on the cs thread
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedGi::IsEnabled()))
+        blessedGiPatch = BlessedGi::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr());
+    }
+
+    // blessed: rtao, pre-draw -- see blessed_ao.h
+    if constexpr (!IsDeferred) {
+      // blessed: async-compute -- the vol kick goes first, so rtao's pass at
+      // the same draw already overlaps the async trace
+      if (unlikely(BlessedVolumetrics::IsAsyncKickEnabled()))
+        BlessedVolumetrics::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedAo::IsEnabled()))
+        BlessedAo::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
 
     VkDrawIndirectCommand draw = { };
     draw.vertexCount   = VertexCount;
@@ -1048,7 +1336,28 @@ namespace dxvk {
     draw.firstVertex   = StartVertexLocation;
     draw.firstInstance = 0u;
 
-    BatchDraw(draw);
+    if (unlikely(blessedGiPatch)) // blessed: gi-cs
+      BlessedBatchDrawGi(draw);
+    else
+      BatchDraw(draw);
+
+    // blessed: shader-replace, twin-draw check of a replaced shader
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedShaderVerify::IsEnabled()))
+        BlessedShaderVerify::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, [&] { BatchDraw(draw); });
+    }
+
+    // blessed: post-draw pixel-shader hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHook::IsEnabled()))
+        BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedPointShadow::IsEnabled())) // blessed: point-lights
+        BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: volumetrics
+        BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedLook::IsEnabled())) // blessed: look-post
+        BlessedLook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr());
+    }
   }
 
 
@@ -1057,10 +1366,125 @@ namespace dxvk {
           UINT            IndexCount,
           UINT            StartIndexLocation,
           INT             BaseVertexLocation) {
+    BLESSED_PROBE_CALL(ContextType, DrawIndexed);
     D3D10DeviceLock lock = LockContext();
+
+    bool blessedScene = false; // blessed: scene-cs, true: static capture on the cs thread
 
     if (unlikely(!IndexCount))
       return;
+
+    // blessed: vanilla-vol-async -- every draw entry point closes the
+    // window first, if still open, and waits at the configured wait
+    // shader (pass 138). See blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: half-rate far field -- skip far draws on off frames and
+    // track the main lit pass. See blessed_halfrate.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHalfRate::IsWatching())
+       && BlessedHalfRate::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr()))
+        return;
+      if (unlikely(BlessedReflectHalfRate::IsWatching()) // blessed: refl-harden
+       && BlessedReflectHalfRate::OnDraw(m_state))
+        return;
+    }
+
+    // blessed: BLESSED_SKIP_CASCADES, immediate context only -- a cascade
+    // depth draw is dropped before it ever reaches BatchDrawIndexed. See
+    // blessed_cascades.h.
+    if constexpr (!IsDeferred) {
+      BLESSED_PROBE_CALL(ContextType, DrawIndexedCascadeCheck);
+      // blessed: perf-halfrate -- pass 138 on off frames (BLESSED_VOL_HALFRATE=2).
+      // See blessed_vanilla_halfrate.h.
+      if (unlikely(BlessedVolHalfRate::ShouldSkipDraw(m_state)))
+        return;
+      if (unlikely(BlessedCascadeSkip::ShouldSkipDraw(m_state))) {
+        BlessedCascadeSkip::RecordSkippedDraw();
+        return;
+      }
+      if (unlikely(BlessedCascadeCache::IsEnabled()) && BlessedCascadeCache::OnDraw( // blessed: cascade-cache
+            static_cast<D3D11ImmediateContext*>(this), m_state, BlessedCascadeDrawKind::Indexed,
+            IndexCount, StartIndexLocation, BaseVertexLocation))
+        return;
+      if (unlikely(BlessedPointShadow::ShouldSkipDraw(static_cast<D3D11ImmediateContext*>(this), m_state))) // blessed: point-lights
+        return;
+      // blessed: gpu track step 2 -- skip vanilla work our replacements
+      // already overwrite. See blessed_skip_replaced.h.
+      if (unlikely(BlessedSkipAo::ShouldSkipDraw(m_state))) {
+        BlessedSkipAo::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipVolumetrics::ShouldSkipDraw(m_state))) {
+        BlessedSkipVolumetrics::RecordSkippedDraw();
+        // blessed: vol-2 -- our trace runs from this draw's hook; the
+        // target comes from m_state's bound rtv, so skip only the draw
+        BlessedVolumetrics::OnSkippedDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+      if (unlikely(BlessedSkipBloom::ShouldSkipDraw(m_state))) {
+        BlessedSkipBloom::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipShadowMask::ShouldSkipDraw(m_state))) {
+        BlessedSkipShadowMask::RecordSkipped();
+        // blessed: the raster mask draw is dropped, but our traced shadow
+        // (and the point-light watcher) is launched from this draw's
+        // post-draw hook: run the hooks, skip only the draw itself.
+        if (unlikely(BlessedHook::IsEnabled()))
+          BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedPointShadow::IsEnabled()))
+          BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: vol-2, the sun capture
+          BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+    }
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing())) {
+        BlessedDrawCounts counts;
+        counts.vertexOrIndexCount = IndexCount;
+        counts.startVertexOrIndex = INT(StartIndexLocation);
+        counts.baseVertex         = BaseVertexLocation;
+        BlessedDump::RecordDraw(m_state, BlessedDumpOp::DrawIndexed, counts);
+      }
+      BlessedAutoInstance::OnDraw(m_state, { true, IndexCount, StartIndexLocation, BaseVertexLocation, 1u, 0u }); // blessed: auto-instancing census
+
+      BlessedGpuPassEvent(BlessedGpuPassKind::Draw); // blessed: gpu-pass-timing
+
+      // blessed: scene-capture hook, immediate context only
+      if (unlikely(BlessedSceneCapture::IsEnabled())) {
+        BLESSED_PROBE_CALL(ContextType, DrawIndexedSceneCapture);
+        blessedScene = BlessedSceneCaptureDraw(IndexCount, StartIndexLocation, BaseVertexLocation, &m_blessedSceneNext); // blessed: scene-cs
+      }
+    }
+
+    // blessed: look-post, pre-draw -- patches the tonemap pass's ps b2
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedLook::IsEnabled()))
+        BlessedLook::OnPreDraw(m_state);
+    }
+
+    // blessed: gi ambient patch, pre-draw -- see the comment on Draw() above.
+    // gi v1: this draw's own index-buffer params, so OnDraw can key the same
+    // CacheKey scene-capture would for this mesh (see BlessedGiDrawIndices).
+    bool blessedGiPatch = false; // blessed: gi-cs, true: patch on the cs thread
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedGi::IsEnabled())) {
+        BLESSED_PROBE_CALL(ContextType, DrawIndexedGi);
+        BlessedGiDrawIndices giIndices;
+        giIndices.valid      = true;
+        giIndices.indexCount = IndexCount;
+        giIndices.startIndex = StartIndexLocation;
+        giIndices.baseVertex = BaseVertexLocation;
+        blessedGiPatch = BlessedGi::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr(), giIndices, &m_blessedGiNext); // blessed: gi-bounds
+      }
+    }
 
     VkDrawIndexedIndirectCommand draw = { };
     draw.indexCount    = IndexCount;
@@ -1069,7 +1493,39 @@ namespace dxvk {
     draw.vertexOffset  = BaseVertexLocation;
     draw.firstInstance = 0u;
 
-    BatchDrawIndexed(draw);
+    // blessed: rtao, pre-draw -- see blessed_ao.h
+    if constexpr (!IsDeferred) {
+      // blessed: async-compute -- the vol kick goes first, so rtao's pass at
+      // the same draw already overlaps the async trace
+      if (unlikely(BlessedVolumetrics::IsAsyncKickEnabled()))
+        BlessedVolumetrics::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedAo::IsEnabled()))
+        BlessedAo::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    { BLESSED_PROBE_CALL(ContextType, DrawIndexedCore);
+      BlessedBatchDrawIndexedAny(draw, blessedGiPatch, blessedScene); // blessed: gi-cs, scene-cs
+    }
+
+    // blessed: shader-replace, twin-draw check of a replaced shader
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedShaderVerify::IsEnabled()))
+        BlessedShaderVerify::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, [&] { BatchDrawIndexed(draw); });
+    }
+
+    // blessed: post-draw pixel-shader hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHook::IsEnabled())) {
+        BLESSED_PROBE_CALL(ContextType, DrawIndexedPostHook);
+        BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      }
+      if (unlikely(BlessedPointShadow::IsEnabled())) // blessed: point-lights
+        BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: volumetrics
+        BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedLook::IsEnabled())) // blessed: look-post
+        BlessedLook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr());
+    }
   }
 
 
@@ -1079,10 +1535,106 @@ namespace dxvk {
           UINT            InstanceCount,
           UINT            StartVertexLocation,
           UINT            StartInstanceLocation) {
+    BLESSED_PROBE_CALL(ContextType, DrawInstanced);
     D3D10DeviceLock lock = LockContext();
 
     if (unlikely(!VertexCountPerInstance || !InstanceCount))
       return;
+
+    // blessed: vanilla-vol-async -- every draw entry point closes the
+    // window first, if still open. See blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: half-rate far field -- skip far draws on off frames and
+    // track the main lit pass. See blessed_halfrate.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHalfRate::IsWatching())
+       && BlessedHalfRate::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr()))
+        return;
+      if (unlikely(BlessedReflectHalfRate::IsWatching()) // blessed: refl-harden
+       && BlessedReflectHalfRate::OnDraw(m_state))
+        return;
+    }
+
+    // blessed: BLESSED_SKIP_CASCADES, immediate context only -- a cascade
+    // depth draw is dropped before it ever reaches BatchDraw. See
+    // blessed_cascades.h.
+    if constexpr (!IsDeferred) {
+      // blessed: perf-halfrate -- pass 138 on off frames (BLESSED_VOL_HALFRATE=2).
+      // See blessed_vanilla_halfrate.h.
+      if (unlikely(BlessedVolHalfRate::ShouldSkipDraw(m_state)))
+        return;
+      if (unlikely(BlessedCascadeSkip::ShouldSkipDraw(m_state))) {
+        BlessedCascadeSkip::RecordSkippedDraw();
+        return;
+      }
+      if (unlikely(BlessedCascadeCache::IsEnabled()) && BlessedCascadeCache::OnDraw( // blessed: cascade-cache, never cached
+            static_cast<D3D11ImmediateContext*>(this), m_state, BlessedCascadeDrawKind::Other, 0u, 0u, 0))
+        return;
+      if (unlikely(BlessedPointShadow::ShouldSkipDraw(static_cast<D3D11ImmediateContext*>(this), m_state))) // blessed: point-lights
+        return;
+      // blessed: gpu track step 2 -- skip vanilla work our replacements
+      // already overwrite. See blessed_skip_replaced.h.
+      if (unlikely(BlessedSkipAo::ShouldSkipDraw(m_state))) {
+        BlessedSkipAo::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipVolumetrics::ShouldSkipDraw(m_state))) {
+        BlessedSkipVolumetrics::RecordSkippedDraw();
+        // blessed: vol-2 -- our trace runs from this draw's hook; the
+        // target comes from m_state's bound rtv, so skip only the draw
+        BlessedVolumetrics::OnSkippedDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+      if (unlikely(BlessedSkipBloom::ShouldSkipDraw(m_state))) {
+        BlessedSkipBloom::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipShadowMask::ShouldSkipDraw(m_state))) {
+        BlessedSkipShadowMask::RecordSkipped();
+        // blessed: the raster mask draw is dropped, but our traced shadow
+        // (and the point-light watcher) is launched from this draw's
+        // post-draw hook: run the hooks, skip only the draw itself.
+        if (unlikely(BlessedHook::IsEnabled()))
+          BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedPointShadow::IsEnabled()))
+          BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: vol-2, the sun capture
+          BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+    }
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing())) {
+        BlessedDrawCounts counts;
+        counts.vertexOrIndexCount = VertexCountPerInstance;
+        counts.instanceCount      = InstanceCount;
+        counts.startVertexOrIndex = INT(StartVertexLocation);
+        counts.startInstance      = StartInstanceLocation;
+        BlessedDump::RecordDraw(m_state, BlessedDumpOp::DrawInstanced, counts);
+      }
+      BlessedAutoInstance::OnDraw(m_state, { false, VertexCountPerInstance, StartVertexLocation, 0, InstanceCount, StartInstanceLocation }); // blessed: auto-instancing census
+    }
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Draw); // blessed: gpu-pass-timing
+
+    // blessed: look-post, pre-draw -- patches the tonemap pass's ps b2
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedLook::IsEnabled()))
+        BlessedLook::OnPreDraw(m_state);
+    }
+
+    // blessed: gi ambient patch, pre-draw -- see the comment on Draw() above.
+    bool blessedGiPatch = false; // blessed: gi-cs, true: patch on the cs thread
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedGi::IsEnabled()))
+        blessedGiPatch = BlessedGi::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr());
+    }
 
     VkDrawIndirectCommand draw = { };
     draw.vertexCount   = VertexCountPerInstance;
@@ -1090,7 +1642,28 @@ namespace dxvk {
     draw.firstVertex   = StartVertexLocation;
     draw.firstInstance = StartInstanceLocation;
 
-    BatchDraw(draw);
+    if (unlikely(blessedGiPatch)) // blessed: gi-cs
+      BlessedBatchDrawGi(draw);
+    else
+      BatchDraw(draw);
+
+    // blessed: shader-replace, twin-draw check of a replaced shader
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedShaderVerify::IsEnabled()))
+        BlessedShaderVerify::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, [&] { BatchDraw(draw); });
+    }
+
+    // blessed: post-draw pixel-shader hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHook::IsEnabled()))
+        BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedPointShadow::IsEnabled())) // blessed: point-lights
+        BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: volumetrics
+        BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedLook::IsEnabled())) // blessed: look-post
+        BlessedLook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr());
+    }
   }
 
 
@@ -1101,10 +1674,128 @@ namespace dxvk {
           UINT            StartIndexLocation,
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
+    BLESSED_PROBE_CALL(ContextType, DrawIndexedInstanced);
     D3D10DeviceLock lock = LockContext();
+
+    bool blessedScene = false; // blessed: scene-cs, true: static capture on the cs thread
 
     if (unlikely(!IndexCountPerInstance || !InstanceCount))
       return;
+
+    // blessed: vanilla-vol-async -- every draw entry point closes the
+    // window first, if still open. See blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: half-rate far field -- skip far draws on off frames and
+    // track the main lit pass. See blessed_halfrate.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHalfRate::IsWatching())
+       && BlessedHalfRate::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr()))
+        return;
+      if (unlikely(BlessedReflectHalfRate::IsWatching()) // blessed: refl-harden
+       && BlessedReflectHalfRate::OnDraw(m_state))
+        return;
+    }
+
+    // blessed: BLESSED_SKIP_CASCADES, immediate context only -- a cascade
+    // depth draw is dropped before it ever reaches BatchDrawIndexed. See
+    // blessed_cascades.h.
+    if constexpr (!IsDeferred) {
+      // blessed: perf-halfrate -- pass 138 on off frames (BLESSED_VOL_HALFRATE=2).
+      // See blessed_vanilla_halfrate.h.
+      if (unlikely(BlessedVolHalfRate::ShouldSkipDraw(m_state)))
+        return;
+      if (unlikely(BlessedCascadeSkip::ShouldSkipDraw(m_state))) {
+        BlessedCascadeSkip::RecordSkippedDraw();
+        return;
+      }
+      if (unlikely(BlessedCascadeCache::IsEnabled()) && BlessedCascadeCache::OnDraw( // blessed: cascade-cache, never cached
+            static_cast<D3D11ImmediateContext*>(this), m_state, BlessedCascadeDrawKind::Other, 0u, 0u, 0))
+        return;
+      if (unlikely(BlessedPointShadow::ShouldSkipDraw(static_cast<D3D11ImmediateContext*>(this), m_state))) // blessed: point-lights
+        return;
+      // blessed: gpu track step 2 -- skip vanilla work our replacements
+      // already overwrite. See blessed_skip_replaced.h.
+      if (unlikely(BlessedSkipAo::ShouldSkipDraw(m_state))) {
+        BlessedSkipAo::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipVolumetrics::ShouldSkipDraw(m_state))) {
+        BlessedSkipVolumetrics::RecordSkippedDraw();
+        // blessed: vol-2 -- our trace runs from this draw's hook; the
+        // target comes from m_state's bound rtv, so skip only the draw
+        BlessedVolumetrics::OnSkippedDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+      if (unlikely(BlessedSkipBloom::ShouldSkipDraw(m_state))) {
+        BlessedSkipBloom::RecordSkipped();
+        return;
+      }
+      if (unlikely(BlessedSkipShadowMask::ShouldSkipDraw(m_state))) {
+        BlessedSkipShadowMask::RecordSkipped();
+        // blessed: the raster mask draw is dropped, but our traced shadow
+        // (and the point-light watcher) is launched from this draw's
+        // post-draw hook: run the hooks, skip only the draw itself.
+        if (unlikely(BlessedHook::IsEnabled()))
+          BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedPointShadow::IsEnabled()))
+          BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: vol-2, the sun capture
+          BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+        return;
+      }
+    }
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing())) {
+        BlessedDrawCounts counts;
+        counts.vertexOrIndexCount = IndexCountPerInstance;
+        counts.instanceCount      = InstanceCount;
+        counts.startVertexOrIndex = INT(StartIndexLocation);
+        counts.baseVertex         = BaseVertexLocation;
+        counts.startInstance      = StartInstanceLocation;
+        BlessedDump::RecordDraw(m_state, BlessedDumpOp::DrawIndexedInstanced, counts);
+      }
+      BlessedAutoInstance::OnDraw(m_state, { true, IndexCountPerInstance, StartIndexLocation, BaseVertexLocation, InstanceCount, StartInstanceLocation }); // blessed: auto-instancing census
+
+      BlessedGpuPassEvent(BlessedGpuPassKind::Draw); // blessed: gpu-pass-timing
+
+      // blessed: scene-capture hook, immediate context only. Multi-instance
+      // draws would need a transform per instance, which this seat doesn't
+      // read (BLESSED_SCENE_XFORM points at one cbuffer slot/offset for the
+      // whole draw) -- so only the InstanceCount == 1 case is captured; see
+      // the seat report for why this stayed out of scope.
+      if (unlikely(BlessedSceneCapture::IsEnabled()) && InstanceCount == 1u)
+        blessedScene = BlessedSceneCaptureDraw(IndexCountPerInstance, StartIndexLocation, BaseVertexLocation, &m_blessedSceneNext); // blessed: scene-cs
+    }
+
+    // blessed: look-post, pre-draw -- patches the tonemap pass's ps b2
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedLook::IsEnabled()))
+        BlessedLook::OnPreDraw(m_state);
+    }
+
+    // blessed: gi ambient patch, pre-draw -- see the comment on Draw() above.
+    // gi v1: same InstanceCount == 1 restriction as the scene-capture hook
+    // above -- a multi-instance draw's mesh/albedo association would need a
+    // transform per instance this seat doesn't read.
+    bool blessedGiPatch = false; // blessed: gi-cs, true: patch on the cs thread
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedGi::IsEnabled())) {
+        BlessedGiDrawIndices giIndices;
+        if (InstanceCount == 1u) {
+          giIndices.valid      = true;
+          giIndices.indexCount = IndexCountPerInstance;
+          giIndices.startIndex = StartIndexLocation;
+          giIndices.baseVertex = BaseVertexLocation;
+        }
+        blessedGiPatch = BlessedGi::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr(), giIndices, &m_blessedGiNext); // blessed: gi-cs, gi-bounds
+      }
+    }
 
     VkDrawIndexedIndirectCommand draw = { };
     draw.indexCount    = IndexCountPerInstance;
@@ -1113,7 +1804,25 @@ namespace dxvk {
     draw.vertexOffset  = BaseVertexLocation;
     draw.firstInstance = StartInstanceLocation;
 
-    BatchDrawIndexed(draw);
+    BlessedBatchDrawIndexedAny(draw, blessedGiPatch, blessedScene); // blessed: gi-cs, scene-cs
+
+    // blessed: shader-replace, twin-draw check of a replaced shader
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedShaderVerify::IsEnabled()))
+        BlessedShaderVerify::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, [&] { BatchDrawIndexed(draw); });
+    }
+
+    // blessed: post-draw pixel-shader hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHook::IsEnabled()))
+        BlessedHook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedPointShadow::IsEnabled())) // blessed: point-lights
+        BlessedPointShadow::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedVolumetrics::IsEnabled())) // blessed: volumetrics
+        BlessedVolumetrics::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state);
+      if (unlikely(BlessedLook::IsEnabled())) // blessed: look-post
+        BlessedLook::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, m_device.ptr());
+    }
   }
 
 
@@ -1122,7 +1831,29 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
+
+    // blessed: vanilla-vol-async -- every draw entry point closes the
+    // window first, if still open. See blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: refl-harden -- a skipped water cube face drops all its draws
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedReflectHalfRate::IsWatching()) // blessed: refl-harden
+       && BlessedReflectHalfRate::OnDraw(m_state))
+        return;
+    }
+
+    if constexpr (!IsDeferred) { // blessed: cascade-cache, an indirect or auto draw may end a cascade (before SetDrawBuffers: ending one resets the context state)
+      if (unlikely(BlessedCascadeCache::IsEnabled()))
+        BlessedCascadeCache::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, BlessedCascadeDrawKind::Other, 0u, 0u, 0);
+    }
+
     SetDrawBuffers(pBufferForArgs, nullptr);
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Draw); // blessed: gpu-pass-timing
 
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
@@ -1157,7 +1888,29 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
+
+    // blessed: vanilla-vol-async -- every draw entry point closes the
+    // window first, if still open. See blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDrawPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: refl-harden -- a skipped water cube face drops all its draws
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedReflectHalfRate::IsWatching()) // blessed: refl-harden
+       && BlessedReflectHalfRate::OnDraw(m_state))
+        return;
+    }
+
+    if constexpr (!IsDeferred) { // blessed: cascade-cache, an indirect or auto draw may end a cascade (before SetDrawBuffers: ending one resets the context state)
+      if (unlikely(BlessedCascadeCache::IsEnabled()))
+        BlessedCascadeCache::OnDraw(static_cast<D3D11ImmediateContext*>(this), m_state, BlessedCascadeDrawKind::Other, 0u, 0u, 0);
+    }
+
     SetDrawBuffers(pBufferForArgs, nullptr);
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Draw); // blessed: gpu-pass-timing
 
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
@@ -1192,22 +1945,115 @@ namespace dxvk {
           UINT            ThreadGroupCountX,
           UINT            ThreadGroupCountY,
           UINT            ThreadGroupCountZ) {
+    BLESSED_PROBE_CALL(ContextType, Dispatch);
     D3D10DeviceLock lock = LockContext();
 
     if (unlikely(!ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ))
       return;
+
+    // blessed: half-rate far field -- a dispatch closes the main pass
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedHalfRate::IsWatching()))
+        BlessedHalfRate::OnDispatch(static_cast<D3D11ImmediateContext*>(this));
+      // blessed: refl-harden -- the volumetric generate's camera, before
+      // anything below may drop that dispatch
+      if (unlikely(BlessedReflectHalfRate::IsWatching()))
+        BlessedReflectHalfRate::OnDispatch(m_state);
+    }
+
+    // blessed: gpu track step 2, immediate context only, opt-in
+    // (BLESSED_VOL_SKIP_RAYMARCH=1) -- see blessed_skip_replaced.h for why
+    // this one stays off by default.
+    if constexpr (!IsDeferred) {
+      // blessed: perf-halfrate -- vanilla volumetric light at half rate
+      if (unlikely(BlessedVolHalfRate::ShouldSkipDispatch(m_state)))
+        return;
+      if (unlikely(BlessedSkipVolumetrics::ShouldSkipDispatch(m_state))) {
+        BlessedSkipVolumetrics::RecordSkippedDispatch();
+        return;
+      }
+    }
+
+    // blessed: vanilla-vol-async -- opens the async-queue recording window
+    // at the froxel generate dispatch (after the skip checks above, so a
+    // half-rate/skipped frame never opens it for a dispatch that will not
+    // run). See blessed_vol_async.h.
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsync::IsEnabled()))
+        BlessedVolAsync::OnDispatchPre(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: vol-collapse -- the volumetric z-integration chain as one
+    // dispatch, the rest of the chain skipped. See blessed_vol_collapse.h.
+    if constexpr (!IsDeferred) {
+      // blessed: vol-async-3 -- vol-async-verify's replay of a window
+      // reproduces exactly what ran; collapse must not see it again
+      if (unlikely(BlessedVolCollapse::IsEnabled()) && !BlessedVolAsyncVerify::IsReplaying()) {
+        if (BlessedVolCollapse::OnDispatch(static_cast<D3D11ImmediateContext*>(this), m_state,
+            ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ))
+          return;
+      }
+    }
+
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing()))
+        BlessedDump::RecordDispatch(m_state, ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+    }
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Compute); // blessed: gpu-pass-timing
 
     AddCost(GpuCostEstimate::Dispatch);
 
     if (unlikely(HasDirtyComputeBindings()))
       ApplyDirtyComputeBindings();
 
+    // blessed: shader-replace, dispatch-size override for a narrowly matched
+    // compacted replacement. Only the real dispatch below is rewritten --
+    // the probe dump above and the shader-verify twin-check below still see
+    // (and replay) the game's own ThreadGroupCount*, since a rewritten
+    // replacement shader tolerates being over-dispatched at the vanilla
+    // shape (extra groups return once col/row is out of range) but the real
+    // vanilla bytecode used in a twin-check does not.
+    UINT dispatchX = ThreadGroupCountX;
+    UINT dispatchY = ThreadGroupCountY;
+    UINT dispatchZ = ThreadGroupCountZ;
+
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDispatchRewrite::IsEnabled()))
+        BlessedDispatchRewrite::Adjust(m_state, dispatchX, dispatchY, dispatchZ);
+    }
+
     EmitCs([=] (DxvkContext* ctx) {
       ctx->dispatch(
-        ThreadGroupCountX,
-        ThreadGroupCountY,
-        ThreadGroupCountZ);
+        dispatchX,
+        dispatchY,
+        dispatchZ);
     });
+
+    // blessed: vol-collapse, post-dispatch (the verify diff after the chain's last dispatch)
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolCollapse::IsEnabled()) && !BlessedVolAsyncVerify::IsReplaying()) // blessed: vol-async-3
+        BlessedVolCollapse::OnDispatchDone(static_cast<D3D11ImmediateContext*>(this), m_state);
+    }
+
+    // blessed: vanilla-vol-async, post-dispatch (BLESSED_VOL_ASYNC_VERIFY's
+    // shadow replay; see blessed_vol_async_verify.h)
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedVolAsyncVerify::IsEnabled())) {
+        // the counts that actually ran: a reshaped replacement (volgen) covers
+        // its volume only at the rewritten shape, and a rewritten shape never
+        // matches a rewrite rule again
+        BlessedVolAsyncVerify::OnDispatchDone(static_cast<D3D11ImmediateContext*>(this), m_state,
+          dispatchX, dispatchY, dispatchZ);
+      }
+    }
+
+    // blessed: shader-replace, twin-draw check of a replaced shader
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedShaderVerify::IsEnabled()))
+        BlessedShaderVerify::OnDispatch(static_cast<D3D11ImmediateContext*>(this), m_state, [&] { if (unlikely(HasDirtyComputeBindings())) ApplyDirtyComputeBindings(); EmitCs([=] (DxvkContext* ctx) { ctx->dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ); }); });
+    }
   }
 
 
@@ -1219,6 +2065,8 @@ namespace dxvk {
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     AddCost(GpuCostEstimate::DispatchIndirect);
+
+    BlessedGpuPassEvent(BlessedGpuPassKind::Compute); // blessed: gpu-pass-timing
 
     if (unlikely(HasDirtyComputeBindings()))
       ApplyDirtyComputeBindings();
@@ -1232,6 +2080,7 @@ namespace dxvk {
 
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::IASetInputLayout(ID3D11InputLayout* pInputLayout) {
+    BLESSED_PROBE_CALL(ContextType, IASetInputLayout);
     D3D10DeviceLock lock = LockContext();
 
     auto inputLayout = static_cast<D3D11InputLayout*>(pInputLayout);
@@ -1255,6 +2104,7 @@ namespace dxvk {
 
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY Topology) {
+    BLESSED_PROBE_CALL(ContextType, IASetPrimitiveTopology);
     D3D10DeviceLock lock = LockContext();
 
     if (m_state.ia.primitiveTopology != Topology) {
@@ -1271,6 +2121,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppVertexBuffers,
     const UINT*                             pStrides,
     const UINT*                             pOffsets) {
+    BLESSED_PROBE_CALL(ContextType, IASetVertexBuffers);
     D3D10DeviceLock lock = LockContext();
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
@@ -1301,6 +2152,7 @@ namespace dxvk {
           ID3D11Buffer*                     pIndexBuffer,
           DXGI_FORMAT                       Format,
           UINT                              Offset) {
+    BLESSED_PROBE_CALL(ContextType, IASetIndexBuffer);
     D3D10DeviceLock lock = LockContext();
 
     auto newBuffer = static_cast<D3D11Buffer*>(pIndexBuffer);
@@ -1393,6 +2245,7 @@ namespace dxvk {
           ID3D11VertexShader*               pVertexShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
+    BLESSED_PROBE_CALL(ContextType, SetShader);
     D3D10DeviceLock lock = LockContext();
 
     auto shader = static_cast<D3D11VertexShader*>(pVertexShader);
@@ -1412,6 +2265,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers<D3D11ShaderType::eVertex>(
@@ -1426,6 +2280,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers1<D3D11ShaderType::eVertex>(
@@ -1439,6 +2294,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
+    BLESSED_PROBE_CALL(ContextType, SetShaderResources);
     D3D10DeviceLock lock = LockContext();
 
     SetShaderResources<D3D11ShaderType::eVertex>(
@@ -1451,6 +2307,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
+    BLESSED_PROBE_CALL(ContextType, SetSamplers);
     D3D10DeviceLock lock = LockContext();
 
     SetSamplers<D3D11ShaderType::eVertex>(
@@ -1529,6 +2386,7 @@ namespace dxvk {
           ID3D11HullShader*                 pHullShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
+    BLESSED_PROBE_CALL(ContextType, SetShader);
     D3D10DeviceLock lock = LockContext();
 
     auto shader = static_cast<D3D11HullShader*>(pHullShader);
@@ -1548,6 +2406,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers<D3D11ShaderType::eHull>(
@@ -1562,6 +2421,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers1<D3D11ShaderType::eHull>(
@@ -1575,6 +2435,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
+    BLESSED_PROBE_CALL(ContextType, SetShaderResources);
     D3D10DeviceLock lock = LockContext();
 
     SetShaderResources<D3D11ShaderType::eHull>(
@@ -1587,6 +2448,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
+    BLESSED_PROBE_CALL(ContextType, SetSamplers);
     D3D10DeviceLock lock = LockContext();
 
     SetSamplers<D3D11ShaderType::eHull>(
@@ -1665,6 +2527,7 @@ namespace dxvk {
           ID3D11DomainShader*               pDomainShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
+    BLESSED_PROBE_CALL(ContextType, SetShader);
     D3D10DeviceLock lock = LockContext();
 
     auto shader = static_cast<D3D11DomainShader*>(pDomainShader);
@@ -1684,6 +2547,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers<D3D11ShaderType::eDomain>(
@@ -1698,6 +2562,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers1<D3D11ShaderType::eDomain>(
@@ -1711,6 +2576,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
+    BLESSED_PROBE_CALL(ContextType, SetShaderResources);
     D3D10DeviceLock lock = LockContext();
 
     SetShaderResources<D3D11ShaderType::eDomain>(
@@ -1723,6 +2589,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
+    BLESSED_PROBE_CALL(ContextType, SetSamplers);
     D3D10DeviceLock lock = LockContext();
 
     SetSamplers<D3D11ShaderType::eDomain>(
@@ -1801,6 +2668,7 @@ namespace dxvk {
           ID3D11GeometryShader*             pShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
+    BLESSED_PROBE_CALL(ContextType, SetShader);
     D3D10DeviceLock lock = LockContext();
 
     auto shader = static_cast<D3D11GeometryShader*>(pShader);
@@ -1820,6 +2688,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers<D3D11ShaderType::eGeometry>(
@@ -1834,6 +2703,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {  
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers1<D3D11ShaderType::eGeometry>(
@@ -1847,6 +2717,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
+    BLESSED_PROBE_CALL(ContextType, SetShaderResources);
     D3D10DeviceLock lock = LockContext();
 
     SetShaderResources<D3D11ShaderType::eGeometry>(
@@ -1859,6 +2730,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
+    BLESSED_PROBE_CALL(ContextType, SetSamplers);
     D3D10DeviceLock lock = LockContext();
 
     SetSamplers<D3D11ShaderType::eGeometry>(
@@ -1937,6 +2809,7 @@ namespace dxvk {
           ID3D11PixelShader*                pPixelShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
+    BLESSED_PROBE_CALL(ContextType, SetShader);
     D3D10DeviceLock lock = LockContext();
 
     auto shader = static_cast<D3D11PixelShader*>(pPixelShader);
@@ -1956,6 +2829,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers<D3D11ShaderType::ePixel>(
@@ -1970,6 +2844,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers1<D3D11ShaderType::ePixel>(
@@ -1983,6 +2858,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
+    BLESSED_PROBE_CALL(ContextType, SetShaderResources);
     D3D10DeviceLock lock = LockContext();
 
     SetShaderResources<D3D11ShaderType::ePixel>(
@@ -1995,6 +2871,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
+    BLESSED_PROBE_CALL(ContextType, SetSamplers);
     D3D10DeviceLock lock = LockContext();
 
     SetSamplers<D3D11ShaderType::ePixel>(
@@ -2073,6 +2950,7 @@ namespace dxvk {
           ID3D11ComputeShader*              pComputeShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
+    BLESSED_PROBE_CALL(ContextType, SetShader);
     D3D10DeviceLock lock = LockContext();
 
     auto shader = static_cast<D3D11ComputeShader*>(pComputeShader);
@@ -2092,6 +2970,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers<D3D11ShaderType::eCompute>(
@@ -2106,6 +2985,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
+    BLESSED_PROBE_CALL(ContextType, SetConstantBuffers);
     D3D10DeviceLock lock = LockContext();
 
     SetConstantBuffers1<D3D11ShaderType::eCompute>(
@@ -2119,6 +2999,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
+    BLESSED_PROBE_CALL(ContextType, SetShaderResources);
     D3D10DeviceLock lock = LockContext();
 
     SetShaderResources<D3D11ShaderType::eCompute>(
@@ -2131,6 +3012,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
+    BLESSED_PROBE_CALL(ContextType, SetSamplers);
     D3D10DeviceLock lock = LockContext();
 
     SetSamplers<D3D11ShaderType::eCompute>(
@@ -2282,6 +3164,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11RenderTargetView* const*    ppRenderTargetViews,
           ID3D11DepthStencilView*           pDepthStencilView) {
+    BLESSED_PROBE_CALL(ContextType, OMSetRenderTargets);
     D3D10DeviceLock lock = LockContext();
 
     SetRenderTargetsAndUnorderedAccessViews(
@@ -2299,6 +3182,7 @@ namespace dxvk {
           UINT                              NumUAVs,
           ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT*                             pUAVInitialCounts) {
+    BLESSED_PROBE_CALL(ContextType, OMSetRenderTargets);
     D3D10DeviceLock lock = LockContext();
 
     SetRenderTargetsAndUnorderedAccessViews(
@@ -2312,6 +3196,7 @@ namespace dxvk {
           ID3D11BlendState*                 pBlendState,
     const FLOAT                             BlendFactor[4],
           UINT                              SampleMask) {
+    BLESSED_PROBE_CALL(ContextType, OMSetBlendState);
     D3D10DeviceLock lock = LockContext();
 
     auto blendState = static_cast<D3D11BlendState*>(pBlendState);
@@ -2337,12 +3222,14 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::OMSetDepthStencilState(
           ID3D11DepthStencilState*          pDepthStencilState,
           UINT                              StencilRef) {
+    BLESSED_PROBE_CALL(ContextType, OMSetDepthStencilState);
     D3D10DeviceLock lock = LockContext();
 
     auto depthStencilState = static_cast<D3D11DepthStencilState*>(pDepthStencilState);
 
     if (m_state.om.dsState != depthStencilState) {
       m_state.om.dsState = depthStencilState;
+      m_state.om.blessedOmGeneration++; // blessed: hook-cpu -- dsState feeds MatchesDepthOnly
       ApplyDepthStencilState();
     }
 
@@ -2433,6 +3320,7 @@ namespace dxvk {
 
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::RSSetState(ID3D11RasterizerState* pRasterizerState) {
+    BLESSED_PROBE_CALL(ContextType, RSSetState);
     D3D10DeviceLock lock = LockContext();
 
     auto newRasterizerState = static_cast<D3D11RasterizerState*>(pRasterizerState);
@@ -2466,6 +3354,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::RSSetViewports(
           UINT                              NumViewports,
     const D3D11_VIEWPORT*                   pViewports) {
+    BLESSED_PROBE_CALL(ContextType, RSSetViewports);
     D3D10DeviceLock lock = LockContext();
 
     if (unlikely(NumViewports > m_state.rs.viewports.size()))
@@ -2507,6 +3396,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::RSSetScissorRects(
           UINT                              NumRects,
     const D3D11_RECT*                       pRects) {
+    BLESSED_PROBE_CALL(ContextType, RSSetScissorRects);
     D3D10DeviceLock lock = LockContext();
 
     if (unlikely(NumRects > m_state.rs.scissors.size()))
@@ -3579,6 +4469,539 @@ namespace dxvk {
   }
 
 
+  // blessed: gi-cs -- see the declaration. A batch only ever grows while
+  // no other command is emitted in between (EmitCs resets m_csDataType), so
+  // every draw in one batch sees the same bound cbuffer slices and one
+  // patch before the batch covers all of them.
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::BlessedBatchDrawGi(
+    const VkDrawIndirectCommand&            draw) {
+    if (unlikely(HasDirtyGraphicsBindings()))
+      ApplyDirtyGraphicsBindings();
+
+    if (m_csDataType == D3D11CmdType::BlessedDrawGi) {
+      auto* drawInfo = m_csChunk->pushData(m_csData, 1u);
+
+      if (likely(drawInfo)) {
+        new (drawInfo) VkDrawIndirectCommand(draw);
+        return;
+      }
+    }
+
+    EmitCsCmd<VkDrawIndirectCommand>(D3D11CmdType::BlessedDrawGi, 1u,
+      [] (DxvkContext* ctx, const VkDrawIndirectCommand* draws, size_t count) {
+        BlessedGi::PatchOnCs(ctx, count);
+        ctx->draw(uint32_t(count), draws);
+      });
+
+    new (m_csData->first()) VkDrawIndirectCommand(draw);
+  }
+
+
+  // blessed: gi-cs, scene-cs -- picks the batch for an indexed draw. The two
+  // claims never meet in practice (scene capture matches the depth
+  // prepass, gi the main lit pass); if they ever do, the capture runs from
+  // its own cs command just before the gi batch, with the bindings applied.
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::BlessedBatchDrawIndexedAny(
+    const VkDrawIndexedIndirectCommand&     draw,
+          bool                              gi,
+          bool                              scene) {
+    if (likely(!(gi | scene))) {
+      BatchDrawIndexed(draw);
+    } else if (!scene) {
+      BlessedBatchDrawIndexedGi(draw);
+    } else if (!gi) {
+      BlessedBatchDrawIndexedScene(draw, m_blessedSceneNext);
+    } else {
+      if (unlikely(HasDirtyGraphicsBindings()))
+        ApplyDirtyGraphicsBindings();
+
+      EmitCs([cRecord = m_blessedSceneNext, cDraw = draw] (DxvkContext* ctx) {
+        BlessedSceneCapture::CaptureOnCs(ctx, cRecord, &cDraw, 1u);
+      });
+
+      BlessedBatchDrawIndexedGi(draw);
+    }
+  }
+
+
+  // blessed: scene-cs -- see the declaration. Same batching as
+  // BatchDrawIndexed, and a claimed draw only joins the open batch while
+  // its record is equal, so one record covers every draw of a batch.
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::BlessedBatchDrawIndexedScene(
+    const VkDrawIndexedIndirectCommand&     draw,
+    const BlessedSceneCsRecord&             record) {
+    if (unlikely(HasDirtyGraphicsBindings()))
+      ApplyDirtyGraphicsBindings();
+
+    if (m_csDataType == D3D11CmdType::BlessedDrawIndexedScene && m_blessedSceneRecord == record) {
+      auto* drawInfo = m_csChunk->pushData(m_csData, 1u);
+
+      if (likely(drawInfo)) {
+        new (drawInfo) VkDrawIndexedIndirectCommand(draw);
+        return;
+      }
+    }
+
+    m_blessedSceneRecord = record;
+
+    EmitCsCmd<VkDrawIndexedIndirectCommand>(D3D11CmdType::BlessedDrawIndexedScene, 1u,
+      [cRecord = record] (DxvkContext* ctx, const VkDrawIndexedIndirectCommand* draws, size_t count) {
+        BlessedSceneCapture::CaptureOnCs(ctx, cRecord, draws, count);
+        ctx->drawIndexed(uint32_t(count), draws);
+      });
+
+    new (m_csData->first()) VkDrawIndexedIndirectCommand(draw);
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::BlessedBatchDrawIndexedGi(
+    const VkDrawIndexedIndirectCommand&     draw) {
+    // blessed: gi-bounds -- only ever valid under BLESSED_GI_SAMPLE=bounds
+    if (unlikely(m_blessedGiNext.valid)) {
+      BlessedBatchDrawIndexedGiBounds(draw);
+      return;
+    }
+
+    if (unlikely(HasDirtyGraphicsBindings()))
+      ApplyDirtyGraphicsBindings();
+
+    if (m_csDataType == D3D11CmdType::BlessedDrawIndexedGi) {
+      auto* drawInfo = m_csChunk->pushData(m_csData, 1u);
+
+      if (likely(drawInfo)) {
+        new (drawInfo) VkDrawIndexedIndirectCommand(draw);
+        return;
+      }
+    }
+
+    EmitCsCmd<VkDrawIndexedIndirectCommand>(D3D11CmdType::BlessedDrawIndexedGi, 1u,
+      [] (DxvkContext* ctx, const VkDrawIndexedIndirectCommand* draws, size_t count) {
+        BlessedGi::PatchOnCs(ctx, count);
+        ctx->drawIndexed(uint32_t(count), draws);
+      });
+
+    new (m_csData->first()) VkDrawIndexedIndirectCommand(draw);
+  }
+
+
+  // blessed: gi-bounds -- see the declaration. Same batching as
+  // BlessedBatchDrawIndexedGi, joined only while the record is equal (the
+  // same pattern as BlessedBatchDrawIndexedScene).
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::BlessedBatchDrawIndexedGiBounds(
+    const VkDrawIndexedIndirectCommand&     draw) {
+    if (unlikely(HasDirtyGraphicsBindings()))
+      ApplyDirtyGraphicsBindings();
+
+    if (m_csDataType == D3D11CmdType::BlessedDrawIndexedGiBounds && m_blessedGiRecord == m_blessedGiNext) {
+      auto* drawInfo = m_csChunk->pushData(m_csData, 1u);
+
+      if (likely(drawInfo)) {
+        new (drawInfo) VkDrawIndexedIndirectCommand(draw);
+        return;
+      }
+    }
+
+    m_blessedGiRecord = m_blessedGiNext;
+
+    EmitCsCmd<VkDrawIndexedIndirectCommand>(D3D11CmdType::BlessedDrawIndexedGiBounds, 1u,
+      [cRecord = m_blessedGiNext] (DxvkContext* ctx, const VkDrawIndexedIndirectCommand* draws, size_t count) {
+        BlessedGi::PatchOnCsBounds(ctx, cRecord, draws, count);
+        ctx->drawIndexed(uint32_t(count), draws);
+      });
+
+    new (m_csData->first()) VkDrawIndexedIndirectCommand(draw);
+  }
+
+
+  template<typename ContextType>
+  bool D3D11CommonContext<ContextType>::BlessedSceneCaptureDraw(
+          UINT                              IndexCount,
+          UINT                              StartIndexLocation,
+          INT                               BaseVertexLocation,
+          BlessedSceneCsRecord*             pRecord) {
+    if (!BlessedSceneCapture::MatchesSelector(m_state))
+      return false;
+
+    // blessed: hook-cpu -- everything below is the "we matched the pass,
+    // now resolve/validate/capture this draw" path; MatchesSelector above
+    // is the (now generation-cached, see blessed_scene_capture.cpp) part
+    // that runs on every draw regardless of whether it matches.
+    BLESSED_PROBE_CALL(ContextType, DrawIndexedSceneCaptureResolve);
+
+    // 1. find the position stream (see D3D11InputLayout::SetBlessedPosition)
+    auto* layout = m_state.ia.inputLayout.ptr();
+
+    // blessed: actor-skinning -- route skinned draws (BLENDINDICES0/
+    // BLENDWEIGHT0 in the input layout) entirely to their own path when
+    // enabled. Zero cost when BLESSED_SCENE_SKINNED is unset (one cached
+    // bool): the static path below is completely unchanged in that case,
+    // and unchanged for every draw this doesn't claim either way.
+    if (BlessedSceneCapture::SkinnedEnabled() && layout && layout->HasBlessedSkinning()) {
+      BlessedSceneCaptureSkinnedDraw(IndexCount, StartIndexLocation, BaseVertexLocation, layout);
+      return false;
+    }
+
+    BLESSED_PROBE_CALL(ContextType, DrawIndexedSceneStatic); // blessed: hook-cpu-2
+
+    // blessed: scene-cs -- only the checks that need nothing but the input
+    // layout and this context's own D3D11 state run here (no buffer Desc(),
+    // no map pointers, no slices). The rest, in the same order, runs on the
+    // cs thread in BlessedSceneCapture::CaptureOnCs against the bound dxvk
+    // state, right before the draw is recorded.
+    if (!layout || !layout->HasBlessedPosition()) {
+      BlessedSceneCapture::RecordSkipped(BlessedSceneSkip::NoPosition);
+      return false;
+    }
+
+    const DxvkVertexAttribute& posAttr = layout->GetBlessedPosition();
+
+    if (posAttr.format != VK_FORMAT_R32G32B32_SFLOAT
+     && posAttr.format != VK_FORMAT_R32G32B32A32_SFLOAT
+     && posAttr.format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+      BlessedSceneCapture::RecordSkipped(BlessedSceneSkip::BadPositionFormat);
+      return false;
+    }
+
+    if (posAttr.binding >= m_state.ia.maxVbCount) {
+      BlessedSceneCapture::RecordSkipped(BlessedSceneSkip::NoPosition);
+      return false;
+    }
+
+    const auto& vb = m_state.ia.vertexBuffers[posAttr.binding];
+
+    if (!vb.buffer.ptr() || vb.stride == 0) {
+      BlessedSceneCapture::RecordSkipped(BlessedSceneSkip::NoPosition);
+      return false;
+    }
+
+    // (5. dynamic vertex buffer -- cs thread)
+
+    // 6./7. topology, index format: decided here, recorded by the cs thread
+    // after its dynamic-vb check, where the old code recorded them
+    const auto& ib = m_state.ia.indexBuffer;
+
+    BlessedSceneCsRecord record;
+    record.posFormat  = posAttr.format;
+    record.posBinding = posAttr.binding;
+    record.posOffset  = posAttr.offset;
+    record.passIndex  = BlessedSceneCapture::FramePassIndex();
+
+    if (m_state.ia.primitiveTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
+      record.deferredA = BlessedSceneSkip::BadTopology;
+    } else if (!ib.buffer.ptr()
+     || (ib.format != DXGI_FORMAT_R16_UINT && ib.format != DXGI_FORMAT_R32_UINT)) {
+      record.deferredA = BlessedSceneSkip::BadIndexFormat;
+    } else {
+      // (8. dynamic index buffer -- cs thread)
+
+      // 9. blessed: rt-lifetime bounds audit -- indexData's device address
+      // is ib.buffer's slice address + ib.offset; that address must itself
+      // be aligned to the index element size, or the BLAS build is a
+      // VU-violating out-of-bounds-shaped read that can device-lost the GPU.
+      // primitiveOffset (StartIndexLocation * elementSize, in
+      // blessed_scene.cpp) is already a multiple of elementSize on its own,
+      // so only ib.offset needs checking here.
+      UINT ibElementSize = ib.format == DXGI_FORMAT_R16_UINT ? 2u : 4u;
+
+      if ((ib.offset % ibElementSize) != 0)
+        record.deferredB = BlessedSceneSkip::MisalignedIndexOffset;
+    }
+
+    // (10. negative base vertex, 11.-13. transform, lod scale and camera,
+    // 14. base vertex range, and the capture itself -- cs thread)
+    *pRecord = record;
+    return true;
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::BlessedSceneCaptureSkinnedDraw(
+          UINT                              IndexCount,
+          UINT                              StartIndexLocation,
+          INT                               BaseVertexLocation,
+          D3D11InputLayout*                 pLayout) {
+    BLESSED_PROBE_CALL(ContextType, DrawIndexedSceneSkinned); // blessed: hook-cpu-2
+
+    // 1. position stream -- same acceptance as the static path (see
+    // BlessedSceneCaptureDraw above).
+    if (!pLayout->HasBlessedPosition()) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoSkinPosition);
+      return;
+    }
+
+    const DxvkVertexAttribute& posAttr = pLayout->GetBlessedPosition();
+
+    if (posAttr.format != VK_FORMAT_R32G32B32_SFLOAT
+     && posAttr.format != VK_FORMAT_R32G32B32A32_SFLOAT
+     && posAttr.format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::BadSkinPositionFormat);
+      return;
+    }
+
+    if (posAttr.binding >= m_state.ia.maxVbCount) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoSkinPosition);
+      return;
+    }
+
+    const auto& posVbState = m_state.ia.vertexBuffers[posAttr.binding];
+
+    if (!posVbState.buffer.ptr() || posVbState.stride == 0) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoSkinPosition);
+      return;
+    }
+
+    if (posVbState.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::DynamicSkinBuffer);
+      return;
+    }
+
+    // 2. BLENDINDICES0 / BLENDWEIGHT0 streams -- see D3D11InputLayout::SetBlessedSkinning.
+    // pLayout->HasBlessedSkinning() is already guaranteed true by the caller.
+    const DxvkVertexAttribute& idxAttr = pLayout->GetBlessedSkinIndices();
+    const DxvkVertexAttribute& wtAttr  = pLayout->GetBlessedSkinWeights();
+
+    if (idxAttr.format != VK_FORMAT_R8G8B8A8_UNORM
+     || wtAttr.format  != VK_FORMAT_R16G16B16A16_SFLOAT) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::BadSkinPositionFormat);
+      return;
+    }
+
+    if (idxAttr.binding >= m_state.ia.maxVbCount || wtAttr.binding >= m_state.ia.maxVbCount) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoSkinPosition);
+      return;
+    }
+
+    const auto& idxVbState = m_state.ia.vertexBuffers[idxAttr.binding];
+    const auto& wtVbState  = m_state.ia.vertexBuffers[wtAttr.binding];
+
+    if (!idxVbState.buffer.ptr() || idxVbState.stride == 0
+     || !wtVbState.buffer.ptr()  || wtVbState.stride == 0) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoSkinPosition);
+      return;
+    }
+
+    if (idxVbState.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC
+     || wtVbState.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::DynamicSkinBuffer);
+      return;
+    }
+
+    if (m_state.ia.primitiveTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::BadTopology);
+      return;
+    }
+
+    const auto& ib = m_state.ia.indexBuffer;
+
+    if (!ib.buffer.ptr()
+     || (ib.format != DXGI_FORMAT_R16_UINT && ib.format != DXGI_FORMAT_R32_UINT)) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::BadIndexFormat);
+      return;
+    }
+
+    if (ib.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::DynamicSkinBuffer);
+      return;
+    }
+
+    UINT ibElementSize = ib.format == DXGI_FORMAT_R16_UINT ? 2u : 4u;
+
+    if ((ib.offset % ibElementSize) != 0) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::BadIndexFormat);
+      return;
+    }
+
+    if (BaseVertexLocation < 0) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NegativeBaseVertex);
+      return;
+    }
+
+    // 3. no b2 (world matrix) -- see docs/research/no-b2-draws.md's
+    // classification: a skinned depth draw has no per-draw object transform
+    // at all, everything lives in the bone buffer below.
+    const auto& vsCbv = m_state.cbv[D3D11ShaderType::eVertex];
+
+    if (2u < vsCbv.maxCount && vsCbv.buffers[2].buffer.ptr()) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::HasWorldMatrix);
+      return;
+    }
+
+    // 4. bones (b10), 3,840 bytes, honouring the bound constant offset --
+    // same GetMapPtr()/constantOffset pattern as the static path's b2 read.
+    constexpr uint32_t BonesSlot = 10u;
+    constexpr uint32_t BonesSize = sizeof(float) * 240u * 4u; // 3,840 bytes
+
+    if (BonesSlot >= vsCbv.maxCount) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoBonesBuffer);
+      return;
+    }
+
+    const auto& bonesCb = vsCbv.buffers[BonesSlot];
+    D3D11Buffer* bonesBuffer = bonesCb.buffer.ptr();
+    void* bonesMapPtr = bonesBuffer ? bonesBuffer->GetMapPtr() : nullptr;
+
+    if (!bonesMapPtr) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoBonesBuffer);
+      return;
+    }
+
+    UINT bonesByteOffset = bonesCb.constantOffset * 16u;
+
+    if (bonesBuffer->Desc()->ByteWidth != BonesSize
+     || bonesByteOffset + BonesSize > bonesBuffer->Desc()->ByteWidth) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::BadBonesSize);
+      return;
+    }
+
+    // blessed: hook-cpu-2 -- the bones are never read here: the draw keeps
+    // the discard allocation b10 is mapped to (D3D11Buffer remembers it for
+    // bones-shaped buffers), and the skin dispatch reads it by address.
+    // Always set for such a buffer; the check only guards the impossible.
+    const Rc<DxvkResourceAllocation>& bonesAllocation = bonesBuffer->BlessedMappedAllocation();
+
+    if (!bonesAllocation || bonesAllocation->mapPtr() != bonesMapPtr) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoBonesBuffer);
+      return;
+    }
+
+    // 5. pivot -- blessed: skin-repair. Skinned::GetBoneTransformMatrix
+    // subtracts the vertex shader's OWN b12 byte 640 (BLESSED_SCENE_SKIN_PIVOT,
+    // default vs:12:640), whatever it holds in this pass. This used to read
+    // BLESSED_SCENE_CAMPOS, which tags the tlas camera and is not the same
+    // quantity (in the prepass vs b12:640 is not the camera position).
+    BlessedSceneCbufferSlot pivotCfg = BlessedSceneCapture::SkinPivotConfig();
+    const auto& pivotCbv = m_state.cbv[pivotCfg.stage];
+
+    if (!pivotCfg.valid || pivotCfg.slot >= pivotCbv.maxCount) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoCamPos);
+      return;
+    }
+
+    const auto& pivotCb = pivotCbv.buffers[pivotCfg.slot];
+    D3D11Buffer* pivotBuffer = pivotCb.buffer.ptr();
+    void* pivotMapPtr = pivotBuffer ? pivotBuffer->GetMapPtr() : nullptr;
+    if (pivotBuffer) // blessed: perf-halfrate -- read per skinned draw: keep it cached
+      pivotBuffer->GetBuffer()->blessedMarkCpuRead();
+
+    if (!pivotMapPtr) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoCamPos);
+      return;
+    }
+
+    UINT pivotByteOffset = pivotCb.constantOffset * 16u + pivotCfg.offset;
+
+    if (pivotByteOffset + 12u > pivotBuffer->Desc()->ByteWidth) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::NoCamPos);
+      return;
+    }
+
+    // blessed: hook-cpu-2 -- the pose dedup (same mesh + same bones twice in
+    // one frame) no longer hashes the bones here: the cs side compares the
+    // arena snapshots directly, and only when a mesh repeats.
+
+    // 6. vertex counts per stream (each stream's own binding may have a
+    // different byte width/stride) -- bound by the smallest, so the compute
+    // shader never reads past any one of the three buffers.
+    auto StreamVertexCount = [] (const D3D11VertexBufferBinding& vbState, const DxvkVertexAttribute& attr) -> UINT {
+      UINT byteWidth  = vbState.buffer->Desc()->ByteWidth;
+      UINT absOffset  = vbState.offset + attr.offset;
+      UINT elemSize   = UINT(lookupFormatInfo(attr.format)->elementSize);
+      return absOffset + elemSize <= byteWidth ? (byteWidth - absOffset - elemSize) / vbState.stride + 1u : 0u;
+    };
+
+    UINT posVertexCount = StreamVertexCount(posVbState, posAttr);
+    UINT idxVertexCount = StreamVertexCount(idxVbState, idxAttr);
+    UINT wtVertexCount  = StreamVertexCount(wtVbState,  wtAttr);
+    UINT vertexCount    = std::min({ posVertexCount, idxVertexCount, wtVertexCount });
+
+    if (UINT(BaseVertexLocation) >= vertexCount) {
+      BlessedSceneCapture::RecordSkinnedSkipped(BlessedSkinSkip::BaseVertexOutOfRange);
+      return;
+    }
+
+    // blessed: hook-cpu-2 -- a draw from a depth-only pass after the mask
+    // pass can never be the tracer's pass (see SkinnedDrawIsLate). Every
+    // check above still ran, so the captured/skipped counts are unchanged;
+    // only the copy and the hand-off are skipped.
+    if (BlessedSceneCapture::SkinnedDrawIsLate()) {
+      BlessedSceneCapture::CountLateSkinnedDraw();
+      BlessedSceneCapture::RecordSkinnedCaptured();
+      return;
+    }
+
+    BLESSED_PROBE_CALL(ContextType, DrawIndexedSceneSkinnedStage); // blessed: hook-cpu-2
+
+    BlessedSceneSkinnedDraw sceneDraw;
+    std::memcpy(sceneDraw.pivot,
+      reinterpret_cast<const uint8_t*>(pivotMapPtr) + pivotByteOffset, 12u);
+
+    // blessed: skin-repair -- BLESSED_SCENE_SKIN_TRACE only
+    if (unlikely(BlessedSceneCapture::SkinTraceEnabled())) {
+      sceneDraw.bonesUsage = uint32_t(bonesBuffer->Desc()->Usage);
+
+      BlessedSceneCbufferSlot camCfg = BlessedSceneCapture::CamPosConfig();
+      const auto& camCbv = m_state.cbv[camCfg.stage];
+
+      if (camCfg.valid && camCfg.slot < camCbv.maxCount) {
+        const auto& camCb = camCbv.buffers[camCfg.slot];
+        D3D11Buffer* camBuffer = camCb.buffer.ptr();
+        void* camMapPtr = camBuffer ? camBuffer->GetMapPtr() : nullptr;
+        UINT camByteOffset = camCb.constantOffset * 16u + camCfg.offset;
+
+        if (camMapPtr && camByteOffset + 12u <= camBuffer->Desc()->ByteWidth) {
+          std::memcpy(sceneDraw.tagCam,
+            reinterpret_cast<const uint8_t*>(camMapPtr) + camByteOffset, 12u);
+          sceneDraw.hasTagCam = true;
+        }
+      }
+    }
+
+    // 7. package the rest -- attribute offsets are baked into each slice's
+    // own offset (see BlessedSceneSkinnedDraw), matching how the static
+    // path folds POSITION0's offset into sceneDraw.vb above.
+    { BLESSED_PROBE_CALL(ContextType, DrawIndexedSceneSkinnedSlices); // blessed: hook-cpu-2
+      sceneDraw.posVb     = posVbState.buffer->GetBufferSlice(
+        posVbState.offset + posAttr.offset, VkDeviceSize(vertexCount) * posVbState.stride);
+      sceneDraw.posStride = posVbState.stride;
+      sceneDraw.posFormat = posAttr.format;
+
+      sceneDraw.idxVb     = idxVbState.buffer->GetBufferSlice(
+        idxVbState.offset + idxAttr.offset, VkDeviceSize(vertexCount) * idxVbState.stride);
+      sceneDraw.idxStride = idxVbState.stride;
+
+      sceneDraw.wtVb      = wtVbState.buffer->GetBufferSlice(
+        wtVbState.offset + wtAttr.offset, VkDeviceSize(vertexCount) * wtVbState.stride);
+      sceneDraw.wtStride  = wtVbState.stride;
+
+      sceneDraw.vertexCount = vertexCount;
+
+      sceneDraw.ib         = ib.buffer->GetBufferSlice(ib.offset);
+      sceneDraw.indexType  = ib.format == DXGI_FORMAT_R16_UINT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+      sceneDraw.indexCount = IndexCount;
+      sceneDraw.startIndex = StartIndexLocation;
+      sceneDraw.baseVertex = BaseVertexLocation;
+
+      sceneDraw.bonesAllocation = bonesAllocation;
+      sceneDraw.bonesOffset     = bonesByteOffset;
+    }
+
+    // blessed: skin-v2 -- which depth-only pass this draw came from; the cs
+    // side keeps only the pass before the mask draw
+    sceneDraw.pass = BlessedSceneCapture::CurrentPass();
+
+    // blessed: hook-cpu-2 -- staged for the frame, not emitted per draw:
+    // the batch goes to the cs thread with this frame's endFrame
+    BlessedSceneCapture::StageSkinnedDraw(sceneDraw);
+
+    BlessedSceneCapture::RecordSkinnedCaptured();
+  }
+
+
   template<typename ContextType>
   template<D3D11ShaderType ShaderStage>
   void D3D11CommonContext<ContextType>::BindShader(
@@ -3693,7 +5116,23 @@ namespace dxvk {
     // target bindings are updated. Set up the attachments.
     for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
       if (m_state.om.rtvs[i] != nullptr) {
-        attachments.color[i].view = m_state.om.rtvs[i]->GetImageView();
+        Rc<DxvkImageView> view = m_state.om.rtvs[i]->GetImageView();
+
+        // blessed: zero-copy-present -- a back-buffer view renders into the
+        // acquired swap chain image instead, see blessed_zero_copy.h.
+        // Immediate context only: a deferred command list may replay into
+        // a later frame (ExecuteCommandList ends the redirect instead).
+        if constexpr (!IsDeferred) {
+          if (unlikely(BlessedZeroCopy::IsEnabled())) {
+            Rc<DxvkImageView> redirect = BlessedZeroCopy::RedirectRenderTarget(
+              GetTypedContext(), view, false);
+
+            if (redirect != nullptr)
+              view = std::move(redirect);
+          }
+        }
+
+        attachments.color[i].view = view;
         attachments.color[i].shadow = m_state.om.rtvs[i]->GetBufferView();
         sampleCount = m_state.om.rtvs[i]->GetSampleCount();
       }
@@ -5294,6 +6733,16 @@ namespace dxvk {
             if (TestSrvHazards<ShaderStage>(resView))
               resView = nullptr;
 
+            // blessed: zero-copy-present -- an SRV of the back buffer (it is
+            // always a render target, so always hazard-tested); a bind
+            // nulled by the hazard check above reads nothing
+            if constexpr (!IsDeferred) {
+              if (unlikely(BlessedZeroCopy::IsEnabled()) && resView != nullptr) {
+                BlessedZeroCopy::OnResourceAccess(GetTypedContext(),
+                  resView->GetViewInfo().pResource, "shader resource view");
+              }
+            }
+
             // Only set if necessary, but don't reset it on every
             // bind as this would be more expensive than a few
             // redundant checks in OMSetRenderTargets and friends.
@@ -5423,6 +6872,7 @@ namespace dxvk {
     }
 
     if (needsUpdate) {
+      m_state.om.blessedOmGeneration++; // blessed: hook-cpu -- rtvs/dsv actually changed
       AddCost(GpuCostEstimate::RenderPass);
       BindFramebuffer();
 
@@ -5779,9 +7229,21 @@ namespace dxvk {
     if (!pDstResource)
       return;
 
+    // blessed: probe dump hook, immediate context only
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedDump::IsCapturing()))
+        BlessedDump::RecordUpdateSubresource(pDstResource, DstSubresource);
+    }
+
     // We need a different code path for buffers
     D3D11_RESOURCE_DIMENSION resourceType;
     pDstResource->GetType(&resourceType);
+
+    // blessed: zero-copy-present -- an update of the back buffer
+    if constexpr (!IsDeferred) {
+      if (unlikely(BlessedZeroCopy::IsEnabled()) && resourceType != D3D11_RESOURCE_DIMENSION_BUFFER)
+        BlessedZeroCopy::OnResourceAccess(GetTypedContext(), pDstResource, "update subresource");
+    }
 
     if (likely(resourceType == D3D11_RESOURCE_DIMENSION_BUFFER)) {
       const auto bufferResource = static_cast<D3D11Buffer*>(pDstResource);

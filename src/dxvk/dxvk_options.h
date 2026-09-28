@@ -89,6 +89,10 @@ namespace dxvk {
     /// Enable descriptor update templates
     bool enableDescriptorUpdateTemplates = env::is32BitHostPlatform();
 
+    /// blessed: enables ray query / acceleration structure build support
+    /// when the device supports it. See also the BLESSED_RT env var.
+    bool enableRayQuery = true;
+
     /// Device name
     std::string deviceFilter;
   };

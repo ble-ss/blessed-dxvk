@@ -37,6 +37,44 @@ namespace dxvk {
       return m_inputs[Index];
     }
 
+    // blessed: scene-capture needs to find the POSITION0 stream after
+    // dxvk has already thrown the D3D11 semantic strings away (see
+    // CreateInputLayout, which is the only place that still has them).
+    bool HasBlessedPosition() const {
+      return m_blessedPositionValid;
+    }
+
+    const DxvkVertexAttribute& GetBlessedPosition() const {
+      return m_blessedPosition;
+    }
+
+    void SetBlessedPosition(const DxvkVertexAttribute& attribute) {
+      m_blessedPosition      = attribute;
+      m_blessedPositionValid = true;
+    }
+
+    // blessed: actor-skinning needs BLENDINDICES0/BLENDWEIGHT0 the same way
+    // scene-capture needs POSITION0 -- see SetBlessedPosition above.
+    bool HasBlessedSkinning() const {
+      return m_blessedSkinningValid;
+    }
+
+    const DxvkVertexAttribute& GetBlessedSkinIndices() const {
+      return m_blessedSkinIndices;
+    }
+
+    const DxvkVertexAttribute& GetBlessedSkinWeights() const {
+      return m_blessedSkinWeights;
+    }
+
+    void SetBlessedSkinning(
+      const DxvkVertexAttribute& indices,
+      const DxvkVertexAttribute& weights) {
+      m_blessedSkinIndices   = indices;
+      m_blessedSkinWeights   = weights;
+      m_blessedSkinningValid = true;
+    }
+
     bool Compare(
       const D3D11InputLayout*     pOther) const;
     
@@ -50,6 +88,15 @@ namespace dxvk {
     uint32_t m_bindingCount = 0;
 
     std::array<DxvkVertexInput, MaxNumVertexAttributes + MaxNumVertexBindings> m_inputs = { };
+
+    // blessed: see SetBlessedPosition
+    bool                m_blessedPositionValid = false;
+    DxvkVertexAttribute m_blessedPosition       = { };
+
+    // blessed: see SetBlessedSkinning
+    bool                m_blessedSkinningValid = false;
+    DxvkVertexAttribute m_blessedSkinIndices    = { };
+    DxvkVertexAttribute m_blessedSkinWeights    = { };
 
     D3D10InputLayout m_d3d10;
 

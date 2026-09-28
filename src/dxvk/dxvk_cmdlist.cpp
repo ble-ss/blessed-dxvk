@@ -243,6 +243,14 @@ namespace dxvk {
     else
       m_transferPool = m_graphicsPool;
 
+    // blessed: async-compute -- a pool on the async family, only if it exists
+    if (unlikely(m_device->blessedHasAsyncQueue()))
+      m_blessedComputePool = new DxvkCommandPool(device, m_device->queues().blessedCompute.queueFamily);
+
+    // blessed: vol-async-3 -- and one on the chain's compute family
+    if (unlikely(m_device->blessedHasVolComputeQueue()))
+      m_blessedVolComputePool = new DxvkCommandPool(device, m_device->queues().blessedVolCompute.queueFamily);
+
     resetCheckpoints();
   }
   
@@ -261,6 +269,9 @@ namespace dxvk {
 
     VkResult status = VK_SUCCESS;
 
+    if (unlikely(BlessedGpuGaps::IsEnabled())) // blessed: gpu-gaps
+      blessedGapSubmit();
+
     static const std::array<DxvkCmdBuffer, 2> SdmaCmdBuffers =
       { DxvkCmdBuffer::SdmaBarriers, DxvkCmdBuffer::SdmaBuffer };
     static const std::array<DxvkCmdBuffer, 2> InitCmdBuffers =
@@ -272,11 +283,22 @@ namespace dxvk {
 
     m_commandSubmission.reset();
 
+    // blessed: async-compute -- next kick to submit (kicks are in chunk order)
+    size_t blessedKick = 0u;
+
     for (size_t i = 0; i < m_cmdSubmissions.size(); i++) {
       bool isFirst = i == 0;
       bool isLast  = i == m_cmdSubmissions.size() - 1;
 
       const auto& cmd = m_cmdSubmissions[i];
+
+      // blessed: async-compute -- kicks recorded before this chunk go to the
+      // async queue now, after every earlier graphics chunk was submitted
+      while (unlikely(blessedKick < m_blessedKicks.size())
+          && m_blessedKicks[blessedKick].beforeChunk <= i) {
+        if ((status = blessedSubmitKick(m_blessedKicks[blessedKick++], semaphores, timelines, trackedId)))
+          return status;
+      }
 
       auto sparseBind = cmd.sparseBind
         ? &m_cmdSparseBinds[cmd.sparseCmd]
@@ -324,6 +346,12 @@ namespace dxvk {
           timelines.transfer, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
       }
 
+      // blessed: async-compute -- a consumer chunk waits for the latest kick
+      if (unlikely(cmd.blessedWaitCompute) && timelines.blessedCompute) {
+        m_commandSubmission.waitSemaphore(semaphores.blessedCompute,
+          timelines.blessedCompute, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+      }
+
       // We promise to never do weird stuff to WSI images on
       // the transfer queue, so blocking graphics is sufficient
       if (isFirst && m_wsiSemaphores.acquire) {
@@ -351,7 +379,8 @@ namespace dxvk {
         // Signal WSI semaphore on the final submission
         if (m_wsiSemaphores.present) {
           m_commandSubmission.signalSemaphore(m_wsiSemaphores.present,
-            0, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+            m_wsiSemaphores.blessedPresentValue, // blessed: present-idle, 0 for binary
+            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
         }
       }
 
@@ -384,7 +413,118 @@ namespace dxvk {
       }
     }
 
+    // blessed: async-compute -- kicks recorded after the last chunk
+    while (unlikely(blessedKick < m_blessedKicks.size())) {
+      if ((status = blessedSubmitKick(m_blessedKicks[blessedKick++], semaphores, timelines, trackedId)))
+        return status;
+    }
+
     return VK_SUCCESS;
+  }
+
+
+  VkResult DxvkCommandList::blessedSubmitKick(
+    const BlessedAsyncKick&             kick,
+    const DxvkTimelineSemaphores&       semaphores,
+          DxvkTimelineSemaphoreValues&  timelines,
+          uint64_t                      trackedId) {
+    // blessed: async-compute -- wait for every graphics chunk submitted so
+    // far (the producer work and anything before it), run the kick, signal
+    // the async timeline. Its own submission object: m_commandSubmission may
+    // hold waits folded in for the next graphics or transfer submit.
+    if (timelines.graphics) {
+      m_blessedSubmission.waitSemaphore(semaphores.graphics,
+        timelines.graphics, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    }
+
+    // blessed: vol-async-3 -- the chain's kick runs after the generate kick
+    // submitted just before it: the one async timeline carries both (a
+    // signal here is then strictly after that one's), so the graphics
+    // wait for the latest value covers both kicks
+    if (kick.volCompute && timelines.blessedCompute) {
+      m_blessedSubmission.waitSemaphore(semaphores.blessedCompute,
+        timelines.blessedCompute, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    }
+
+    m_blessedSubmission.executeCommandBuffer(kick.cmdBuffer);
+
+    m_blessedSubmission.signalSemaphore(semaphores.blessedCompute,
+      ++timelines.blessedCompute, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+
+    // no latency present id on the async queue: reflex tracks graphics
+    (void) trackedId;
+    return m_blessedSubmission.submit(m_device, kick.volCompute
+      ? m_device->queues().blessedVolCompute.queueHandle
+      : m_device->queues().blessedCompute.queueHandle, 0u);
+  }
+
+
+  void DxvkCommandList::blessedAsyncBegin(bool volCompute) {
+    // blessed: async-compute -- apply any pending heap re-bind to the
+    // graphics buffers first; the swap below would hide the exec buffer
+    // from it
+    if (m_device->canUseDescriptorHeap())
+      ensureDescriptorHeapBinding();
+
+    // close the producer chunk, so the kick can wait for it
+    next();
+
+    // blessed: vol-async-3 -- the chain's kick records on the compute family
+    m_blessedVolCompute = volCompute;
+
+    VkCommandBuffer cmdBuffer = (volCompute ? m_blessedVolComputePool : m_blessedComputePool)
+      ->getCommandBuffer(DxvkCmdBuffer::ExecBuffer);
+
+    if (m_device->canUseDescriptorHeap()) {
+      bindSamplerHeap(cmdBuffer);
+      bindResourceHeap(cmdBuffer);
+    } else if (m_device->canUseDescriptorBuffer()) {
+      bindDescriptorBuffers(cmdBuffer);
+    }
+
+    m_blessedHeapBase = m_descriptorRange != nullptr
+      ? m_descriptorRange->getHeapInfo().gpuAddress : 0u;
+
+    m_blessedGfxExecCommands = m_cmd.execCommands;
+    m_blessedGfxExec = std::exchange(m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)], cmdBuffer);
+  }
+
+
+  void DxvkCommandList::blessedAsyncEnd() {
+    VkCommandBuffer cmdBuffer = std::exchange(
+      m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)], m_blessedGfxExec);
+    m_blessedGfxExec = VK_NULL_HANDLE;
+
+    // recording into the swapped slot marked the graphics chunk as used
+    m_cmd.execCommands = m_blessedGfxExecCommands;
+
+    endCommandBuffer(cmdBuffer);
+
+    // a new descriptor range allocated meanwhile was bound into every buffer
+    // in m_cmd, which held the compute buffer instead of the graphics one
+    VkDeviceAddress heapBase = m_descriptorRange != nullptr
+      ? m_descriptorRange->getHeapInfo().gpuAddress : 0u;
+
+    if (heapBase != m_blessedHeapBase) {
+      VkCommandBuffer gfx = m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)];
+
+      if (m_device->canUseDescriptorHeap())
+        bindResourceHeap(gfx);
+      else if (m_device->canUseDescriptorBuffer())
+        bindDescriptorBuffers(gfx);
+    }
+
+    BlessedAsyncKick kick;
+    kick.cmdBuffer   = cmdBuffer;
+    kick.beforeChunk = uint32_t(m_cmdSubmissions.size());
+    kick.volCompute  = std::exchange(m_blessedVolCompute, false); // blessed: vol-async-3
+    m_blessedKicks.push_back(kick);
+  }
+
+
+  void DxvkCommandList::blessedAsyncWait() {
+    next();
+    m_cmd.blessedWaitCompute = true;
   }
   
   
@@ -423,6 +563,9 @@ namespace dxvk {
             m_cmd.cmdBuffers[i], m_checkpointIds[i]);
         }
 
+        if (unlikely(BlessedGpuGaps::IsEnabled())) // blessed: gpu-gaps
+          blessedGapMark(m_cmd.cmdBuffers[i], DxvkCmdBuffer(i), true);
+
         endCommandBuffer(m_cmd.cmdBuffers[i]);
       }
     }
@@ -438,6 +581,7 @@ namespace dxvk {
 
   void DxvkCommandList::next() {
     bool push = m_cmd.sparseBind || m_cmd.execCommands;
+    bool renewExec = false; // blessed: vol-async-3
 
     for (uint32_t i = 0; i < m_cmd.cmdBuffers.size(); i++) {
       DxvkCmdBuffer cmdBuffer = DxvkCmdBuffer(i);
@@ -446,12 +590,12 @@ namespace dxvk {
         continue;
 
       if (m_cmd.cmdBuffers[i]) {
+        if (unlikely(BlessedGpuGaps::IsEnabled())) // blessed: gpu-gaps
+          blessedGapMark(m_cmd.cmdBuffers[i], cmdBuffer, true);
+
         endCommandBuffer(m_cmd.cmdBuffers[i]);
 
-        m_cmd.cmdBuffers[i] = cmdBuffer == DxvkCmdBuffer::ExecBuffer
-          ? allocateCommandBuffer(cmdBuffer)
-          : VK_NULL_HANDLE;
-
+        renewExec |= cmdBuffer == DxvkCmdBuffer::ExecBuffer; // blessed: vol-async-3
         push = true;
       }
     }
@@ -459,11 +603,26 @@ namespace dxvk {
     if (!push)
       return;
 
+    // blessed: vol-async-3 -- push the buffers just ended, then replace
+    // them. Upstream replaced them inside the loop above, before the push,
+    // so the chunk carried the fresh exec buffer instead of the recorded
+    // one: the recorded commands were never submitted and the fresh buffer
+    // was submitted twice (once here, once with the next chunk). Latent
+    // upstream (only sparse binds split there); every async kick hits it.
     m_cmdSubmissions.push_back(m_cmd);
+
+    for (uint32_t i = 0; i < m_cmd.cmdBuffers.size(); i++) {
+      if (DxvkCmdBuffer(i) != DxvkCmdBuffer::ExecBuffer)
+        m_cmd.cmdBuffers[i] = VK_NULL_HANDLE;
+    }
+
+    if (renewExec)
+      m_cmd.cmdBuffers[uint32_t(DxvkCmdBuffer::ExecBuffer)] = allocateCommandBuffer(DxvkCmdBuffer::ExecBuffer);
 
     m_cmd.execCommands = VK_FALSE;
     m_cmd.syncSdma = VK_FALSE;
     m_cmd.sparseBind = VK_FALSE;
+    m_cmd.blessedWaitCompute = false; // blessed: async-compute
   }
 
   
@@ -496,6 +655,7 @@ namespace dxvk {
 
     m_waitSemaphores.clear();
     m_signalSemaphores.clear();
+    m_blessedGapMarks.clear(); // blessed: gpu-gaps
 
     m_cmdSubmissions.clear();
     m_cmdSparseBinds.clear();
@@ -505,6 +665,15 @@ namespace dxvk {
     // Reset actual command buffers and pools
     m_graphicsPool->reset();
     m_transferPool->reset();
+
+    // blessed: async-compute
+    m_blessedKicks.clear();
+
+    if (m_blessedComputePool != nullptr)
+      m_blessedComputePool->reset();
+
+    if (m_blessedVolComputePool != nullptr) // blessed: vol-async-3
+      m_blessedVolComputePool->reset();
   }
 
 
@@ -1051,6 +1220,9 @@ namespace dxvk {
 
     if (type <= DxvkCmdBuffer::InitBuffer && m_device->canUseDescriptorBuffer())
       bindDescriptorBuffers(cmdBuffer);
+
+    if (unlikely(BlessedGpuGaps::IsEnabled())) // blessed: gpu-gaps
+      blessedGapMark(cmdBuffer, type, false);
 
     return cmdBuffer;
   }

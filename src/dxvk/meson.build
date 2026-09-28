@@ -26,6 +26,38 @@ dxvk_shaders = files([
   'hud/shaders/hud_text_vert.vert',
 ])
 
+# blessed: compiled with glsl_generator_blessed (no -gVS) -- see meson.build
+dxvk_shaders_blessed = files([
+  'shaders/blessed_rt_selftest.comp',
+  'shaders/blessed_sun_shadow.comp',
+  'shaders/blessed_soft_shadow_trace.comp',
+  'shaders/blessed_soft_shadow_filter.comp',
+  'shaders/blessed_skin.comp',
+  'shaders/blessed_gi_trace.comp',
+  'shaders/blessed_gi_albedo.comp',
+  'shaders/blessed_gi_bounds.comp', # blessed: gi-bounds
+  'shaders/blessed_point_shadow.comp', # blessed: point-lights
+  'shaders/blessed_point_soft_trace.comp', # blessed: point-lights
+  'shaders/blessed_point_soft_filter.comp', # blessed: point-lights
+  'shaders/blessed_ao_trace.comp',   # blessed: rtao
+  'shaders/blessed_ao_blur.comp',    # blessed: rtao
+  'shaders/blessed_ao_resolve.comp', # blessed: rtao
+  'shaders/blessed_vol_trace.comp',    # blessed: volumetrics
+  'shaders/blessed_vol_upsample.comp', # blessed: volumetrics
+  'shaders/blessed_vol_dump.comp',     # blessed: volumetrics
+  'shaders/blessed_look_prep.comp', # blessed: look-post
+  'shaders/blessed_look_composite.comp', # blessed: look-post
+  'shaders/blessed_cascade_min_vert.vert', # blessed: cascade-cache
+  'shaders/blessed_cascade_min_frag.frag', # blessed: cascade-cache
+  'shaders/blessed_cascade_verify.comp',   # blessed: cascade-cache
+  'shaders/blessed_cascade_bounds.comp',   # blessed: cascade-cache
+  'shaders/blessed_vrs_rate.comp', # blessed: vrs
+  'shaders/blessed_vrs_tint.comp', # blessed: vrs
+  'shaders/blessed_halfrate_capture.comp', # blessed: half-rate far field
+  'shaders/blessed_halfrate_fill_vert.vert', # blessed: half-rate far field
+  'shaders/blessed_halfrate_fill_frag.frag', # blessed: half-rate far field
+])
+
 dxvk_src = [
   'dxvk_access.cpp',
   'dxvk_adapter.cpp',
@@ -33,6 +65,32 @@ dxvk_src = [
   'dxvk_barrier.cpp',
   'dxvk_buffer.cpp',
   'dxvk_cmdlist.cpp',
+
+  'blessed/blessed_ao.cpp', # blessed: rtao
+  'blessed/blessed_async.cpp', # blessed: async-compute
+  'blessed/blessed_vol_async.cpp', # blessed: vanilla-vol-async
+  'blessed/blessed_cascade_cache.cpp', # blessed: cascade-cache
+  'blessed/blessed_cascade_bounds.cpp', # blessed: cascade-cache
+  'blessed/blessed_cb_ring.cpp', # blessed: cb-ring
+  'blessed/blessed_cb_mirror.cpp', # blessed: cb-mirror
+  'blessed/blessed_gi.cpp',
+  'blessed/blessed_gi_bounds.cpp', # blessed: gi-bounds
+  'blessed/blessed_gpu_gaps.cpp', # blessed: gpu-gaps
+  'blessed/blessed_present.cpp', # blessed: present-idle
+  'blessed/blessed_present_bridge.cpp', # blessed: present-idle
+  'blessed/blessed_fse.cpp', # blessed: present-fse-appcontrolled
+  'blessed/blessed_point_shadow.cpp', # blessed: point-lights
+  'blessed/blessed_look.cpp', # blessed: look-post
+  'blessed/blessed_halfrate.cpp', # blessed: half-rate far field
+  'blessed/blessed_layer_tracking.cpp', # blessed: perlayer
+  'blessed/blessed_rt.cpp',
+  'blessed/blessed_scene.cpp',
+  'blessed/blessed_shadow.cpp',
+  'blessed/blessed_skin_debug.cpp',
+  'blessed/blessed_soft_shadow.cpp',
+  'blessed/blessed_volumetrics.cpp', # blessed: volumetrics
+  'blessed/blessed_vrs.cpp', # blessed: vrs
+
   'dxvk_compute.cpp',
   'dxvk_constant_state.cpp',
   'dxvk_context.cpp',
@@ -102,7 +160,10 @@ if platform == 'linux'
   dxvk_extra_deps += [ cpp.find_library('dl', required: false) ]
 endif
 
-dxvk_lib = static_library('dxvk', dxvk_src, glsl_generator.process(dxvk_shaders), dxvk_version,
+dxvk_lib = static_library('dxvk', dxvk_src,
+  glsl_generator.process(dxvk_shaders),
+  glsl_generator_blessed.process(dxvk_shaders_blessed),
+  dxvk_version,
   link_with           : [ util_lib, spirv_lib, wsi_lib ],
   dependencies        : [ dxbc_spirv_dep, vkcommon_dep ] + dxvk_extra_deps,
   include_directories : [ dxvk_include_path ],

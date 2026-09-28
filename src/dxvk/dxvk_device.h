@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include "dxvk_adapter.h"
 #include "dxvk_buffer.h"
 #include "dxvk_compute.h"
@@ -30,6 +32,19 @@ namespace dxvk {
   
   class DxvkInstance;
   class DxvkShaderCache;
+
+  // blessed: rt plumbing, defined in blessed/blessed_rt.h -- forward
+  // declared here so the header doesn't need to pull it in everywhere
+  // DxvkDevice.h is included.
+  class BlessedRt;
+
+  // blessed: scene capture, defined in blessed/blessed_scene.h -- same
+  // forward-declare-only deal as BlessedRt above.
+  class BlessedScene;
+
+  // blessed: gi probe grid, defined in blessed/blessed_gi.h -- same
+  // forward-declare-only deal as BlessedRt above.
+  class BlessedGiState;
 
   class DxvkIrShader;
   class DxvkIrShaderConverter;
@@ -69,6 +84,12 @@ namespace dxvk {
     DxvkDeviceQueue graphics;
     DxvkDeviceQueue transfer;
     DxvkDeviceQueue sparse;
+    // blessed: async-compute -- null handle unless BLESSED_ASYNC=1 found one
+    DxvkDeviceQueue blessedCompute;
+    // blessed: vol-async-3 -- null handle unless BLESSED_VOL_ASYNC=2 found one
+    DxvkDeviceQueue blessedVolCompute;
+    // blessed: present-idle -- null handle unless BLESSED_PRESENT=queue got one
+    DxvkDeviceQueue blessedPresent;
   };
   
   /**
@@ -179,8 +200,46 @@ namespace dxvk {
     DxvkSharingModeInfo getSharingMode() const {
       DxvkSharingModeInfo result = { };
       result.queueFamilies[0] = m_queues.graphics.queueFamily;
-      result.queueFamilies[1] = m_queues.transfer.queueFamily;
+      result.familyCount = 1u;
+
+      // blessed: async-compute -- distinct families only; the async family
+      // joins only when BLESSED_ASYNC=1 created a queue in a new family
+      if (m_queues.transfer.queueFamily != m_queues.graphics.queueFamily)
+        result.queueFamilies[result.familyCount++] = m_queues.transfer.queueFamily;
+
+      if (m_queues.blessedCompute.queueHandle
+       && m_queues.blessedCompute.queueFamily != m_queues.graphics.queueFamily
+       && m_queues.blessedCompute.queueFamily != m_queues.transfer.queueFamily)
+        result.queueFamilies[result.familyCount++] = m_queues.blessedCompute.queueFamily;
+
+      // blessed: vol-async-3 -- the chain's compute family reads cbuffers
+      // and descriptor heaps, so buffers are shared with it too
+      if (m_queues.blessedVolCompute.queueHandle
+       && m_queues.blessedVolCompute.queueFamily != m_queues.graphics.queueFamily
+       && m_queues.blessedVolCompute.queueFamily != m_queues.transfer.queueFamily
+       && (!m_queues.blessedCompute.queueHandle
+        || m_queues.blessedVolCompute.queueFamily != m_queues.blessedCompute.queueFamily)
+       && result.familyCount < result.queueFamilies.size())
+        result.queueFamilies[result.familyCount++] = m_queues.blessedVolCompute.queueFamily;
+
       return result;
+    }
+
+    // blessed: async-compute -- true when BLESSED_ASYNC=1 got a second queue
+    bool blessedHasAsyncQueue() const {
+      return m_queues.blessedCompute.queueHandle != VK_NULL_HANDLE;
+    }
+
+    // blessed: vol-async-3 -- true when BLESSED_VOL_ASYNC=2 got its chain queue
+    bool blessedHasVolComputeQueue() const {
+      return m_queues.blessedVolCompute.queueHandle != VK_NULL_HANDLE;
+    }
+
+    // blessed: async-compute -- true when the async queue is in another
+    // family, so pass-owned images it touches must be created concurrent
+    bool blessedAsyncNeedsConcurrent() const {
+      return blessedHasAsyncQueue()
+          && m_queues.blessedCompute.queueFamily != m_queues.graphics.queueFamily;
     }
 
     /**
@@ -329,6 +388,40 @@ namespace dxvk {
      */
     bool hasCudaInterop() const {
       return m_features.nvxImageViewHandle;
+    }
+
+    // blessed: ray query + acceleration structure build input support
+    /**
+     * \brief Checks whether ray query and acceleration structure building are supported
+     * \returns \c true if the device supports building and querying acceleration structures.
+     */
+    bool supportsRayQuery() const {
+      return m_features.khrAccelerationStructure.accelerationStructure
+          && m_features.khrRayQuery.rayQuery;
+    }
+
+    /**
+     * \brief Ray query / acceleration structure plumbing
+     * \returns The rt helper, or \c nullptr if supportsRayQuery() is \c false
+     */
+    BlessedRt* blessedRt() const {
+      return m_blessedRt.get();
+    }
+
+    /**
+     * \brief Scene-capture plumbing (blas/tlas builder over the game's own draws)
+     * \returns The scene helper, or \c nullptr if it was never enabled
+     */
+    BlessedScene* blessedScene() const {
+      return m_blessedScene.get();
+    }
+
+    /**
+     * \brief Gi probe grid plumbing (BLESSED_GI=probes)
+     * \returns The gi helper, or \c nullptr if it was never enabled
+     */
+    BlessedGiState* blessedGi() const {
+      return m_blessedGi.get();
     }
 
     /**
@@ -768,6 +861,17 @@ namespace dxvk {
     DxvkDevicePerfHints         m_perfHints;
     DxvkObjects                 m_objects;
     DxvkCheckpointBuffer        m_checkpoints;
+
+    // blessed: created only when supportsRayQuery() is true; costs nothing otherwise
+    std::unique_ptr<BlessedRt>  m_blessedRt;
+
+    // blessed: created only when m_blessedRt exists and a scene-capture
+    // selector env var is set; costs nothing otherwise
+    std::unique_ptr<BlessedScene> m_blessedScene;
+
+    // blessed: created only when m_blessedRt exists and BLESSED_GI=probes;
+    // costs nothing otherwise
+    std::unique_ptr<BlessedGiState> m_blessedGi;
 
     sync::Spinlock              m_statLock;
     DxvkStatCounters            m_statCounters;

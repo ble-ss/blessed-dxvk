@@ -302,12 +302,14 @@ namespace dxvk {
     
     /**
      * \brief Executes all commands
-     * 
+     *
      * This will also reset the chunk
      * so that it can be reused.
      * \param [in] ctx The context
+     * \returns Number of commands executed
      */
-    void executeAll(DxvkContext* ctx);
+    // blessed: return value added for the probe seat's per-window command count
+    uint32_t executeAll(DxvkContext* ctx);
     
     /**
      * \brief Resets chunk

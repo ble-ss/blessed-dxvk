@@ -21,6 +21,13 @@
 #include "d3d11_device_child.h"
 #include "d3d11_texture.h"
 
+#include "blessed_scene_capture.h" // blessed: scene-cs, BlessedSceneCsRecord
+#include "blessed_gi.h" // blessed: gi-bounds, BlessedGiCsRecord
+#include "blessed_gpu_passes.h" // blessed: gpu-pass-timing
+#include "blessed_autoinstance.h" // blessed: auto-instancing census
+#include "blessed_flush.h" // blessed: gpu-gaps
+#include "blessed_midframe_split.h" // blessed: between-passes, BLESSED_MIDFRAME_SPLIT
+
 namespace dxvk {
 
   class D3D11DeferredContext;
@@ -72,6 +79,21 @@ namespace dxvk {
 
     template<typename T> friend class D3D11DeviceContextExt;
     template<typename T> friend class D3D11UserDefinedAnnotation;
+    // blessed: needs EmitCs to hand the shadow-pass dispatch to the cs
+    // thread from a BlessedHook callback, which lives outside this class
+    friend class BlessedShadow;
+    // blessed: same reasoning -- BlessedGi::OnDraw hands the gi mesh/albedo
+    // note to the cs thread from the pre-draw hook, also outside this class
+    friend class BlessedGi;
+    friend class BlessedPointShadow; // blessed: point-lights, same reasoning
+    friend class BlessedAo; // blessed: rtao, same reasoning (pre-draw hook)
+    friend class BlessedVolumetrics; // blessed: volumetrics, same reasoning
+    friend class BlessedVolAsync; // blessed: vanilla-vol-async, same reasoning
+    // blessed: look-post -- EmitCs and RestoreCommandListState, same reasoning
+    friend class BlessedLook;
+    friend struct BlessedCascadeCacheCtx; // blessed: cascade-cache, EmitCs/BindFramebuffer/Restore from the draw hook
+    friend class BlessedHalfRate; // blessed: half-rate far field, same reasoning
+    friend class BlessedZeroCopy; // blessed: zero-copy-present, BindFramebuffer after a fallback
 
     // Use a local staging buffer to handle tiny uploads, most
     // of the time we're fine with hitting the global allocator
@@ -794,6 +816,18 @@ namespace dxvk {
 
     D3D11CmdType                m_csDataType = D3D11CmdType::None;
 
+    // blessed: scene-cs -- the record of the open BlessedDrawIndexedScene
+    // batch; a claimed draw joins it only while its own record is equal
+    BlessedSceneCsRecord        m_blessedSceneRecord;
+    // blessed: scene-cs -- the record BlessedSceneCaptureDraw filled for the
+    // draw being issued (read only when it returned true)
+    BlessedSceneCsRecord        m_blessedSceneNext;
+
+    // blessed: gi-bounds -- same pair for the bounds-sampled gi batch;
+    // m_blessedGiNext is filled by BlessedGi::OnDraw (bounds mode only)
+    BlessedGiCsRecord           m_blessedGiRecord;
+    BlessedGiCsRecord           m_blessedGiNext;
+
     DxvkCsChunkFlags            m_csFlags;
     DxvkCsChunkRef              m_csChunk;
     DxvkCsDataBlock*            m_csData = nullptr;
@@ -856,6 +890,59 @@ namespace dxvk {
 
     void BatchDrawIndexed(
       const VkDrawIndexedIndirectCommand&     draw);
+
+    // blessed: gi-cs -- BatchDraw/BatchDrawIndexed for a draw the gi
+    // ambient patch claimed (BlessedGi::OnDraw returned true): same batching,
+    // own cs command type, and the cs side runs BlessedGi::PatchOnCs once per
+    // batch right before recording it. Immediate context only.
+    void BlessedBatchDrawGi(
+      const VkDrawIndirectCommand&            draw);
+
+    void BlessedBatchDrawIndexedGi(
+      const VkDrawIndexedIndirectCommand&     draw);
+
+    // blessed: gi-bounds -- BlessedBatchDrawIndexedGi for a draw with a
+    // valid m_blessedGiNext: joins the open batch only while the record is
+    // equal, and the cs side runs BlessedGi::PatchOnCsBounds.
+    void BlessedBatchDrawIndexedGiBounds(
+      const VkDrawIndexedIndirectCommand&     draw);
+
+    // blessed: scene-cs -- BatchDrawIndexed for a draw the static scene
+    // capture claimed: same batching, own cs command type carrying
+    // \p record, and the cs side runs BlessedSceneCapture::CaptureOnCs on
+    // the batch right before recording it. Immediate context only.
+    void BlessedBatchDrawIndexedAny(
+      const VkDrawIndexedIndirectCommand&     draw,
+            bool                              gi,
+            bool                              scene);
+
+    void BlessedBatchDrawIndexedScene(
+      const VkDrawIndexedIndirectCommand&     draw,
+      const BlessedSceneCsRecord&             record);
+
+    // blessed: scene-capture per-draw hook, immediate context only -- see
+    // src/d3d11/blessed_scene_capture.h and src/dxvk/blessed/blessed_scene.h.
+    // Cheap when disabled: one cached-bool branch at each of the two call
+    // sites (DrawIndexed, DrawIndexedInstanced) before this is ever called.
+    // blessed: scene-cs -- returns true when the static path claims the
+    // draw; the caller then batches it with BlessedBatchDrawIndexedScene
+    // and \p pRecord.
+    bool BlessedSceneCaptureDraw(
+            UINT                              IndexCount,
+            UINT                              StartIndexLocation,
+            INT                               BaseVertexLocation,
+            BlessedSceneCsRecord*             pRecord);
+
+    // blessed: actor-skinning -- called from BlessedSceneCaptureDraw itself
+    // when BLESSED_SCENE_SKINNED=1 and the input layout has BLENDINDICES0/
+    // BLENDWEIGHT0 (see D3D11InputLayout::HasBlessedSkinning). Handles the
+    // draw entirely (including RecordCaptured/RecordSkinnedSkipped); the
+    // static path is never reached for a draw this claims.
+    void BlessedSceneCaptureSkinnedDraw(
+            UINT                              IndexCount,
+            UINT                              StartIndexLocation,
+            INT                               BaseVertexLocation,
+            D3D11InputLayout*                 pLayout);
 
     template<D3D11ShaderType ShaderStage>
     void BindShader(
@@ -1199,6 +1286,32 @@ namespace dxvk {
 
     static DxvkBlendMode InitDefaultBlendState();
 
+    // blessed: gpu-pass-timing, a gpu timestamp when this call begins a
+    // new pass (BLESSED_GPU_PASSES, see blessed_gpu_passes.h)
+    void BlessedGpuPassEvent(BlessedGpuPassKind kind) {
+      if constexpr (!IsDeferred) {
+        // blessed: auto-instancing census -- clears, copies, resolves and
+        // dispatches end a merge segment
+        if (kind != BlessedGpuPassKind::Draw)
+          BlessedAutoInstance::OnBarrier();
+
+        // blessed: between-passes -- BLESSED_MIDFRAME_SPLIT, see
+        // blessed_midframe_split.h
+        if (unlikely(BlessedMidframeSplit::IsEnabled()))
+          BlessedMidframeSplit::OnPassEvent(static_cast<D3D11ImmediateContext*>(this), kind);
+
+        if (unlikely(BlessedGpuPasses::IsEnabled())) {
+          BlessedGpuPassMark mark = BlessedGpuPasses::OnCall(m_device.ptr(), m_state, kind);
+
+          if (mark.query != nullptr) {
+            EmitCs([cMark = std::move(mark)] (DxvkContext* ctx) {
+              BlessedGpuPasses::WriteMark(ctx, cMark);
+            });
+          }
+        }
+      }
+    }
+
     template<bool AllowFlush = true, typename Cmd>
     void EmitCs(Cmd&& command) {
       if (unlikely(m_csDataType != D3D11CmdType::None)) {
@@ -1211,7 +1324,7 @@ namespace dxvk {
         m_csChunk = AllocCsChunk();
 
         if constexpr (!IsDeferred && AllowFlush)
-          GetTypedContext()->ConsiderFlush(GpuFlushType::ImplicitWeakHint);
+          GetTypedContext()->ConsiderFlush(BlessedFlush::ChunkHint()); // blessed: gpu-gaps, BLESSED_FLUSH
 
         m_csChunk->push(command);
       }
@@ -1227,7 +1340,7 @@ namespace dxvk {
         m_csChunk = AllocCsChunk();
 
         if constexpr (!IsDeferred && AllowFlush)
-          GetTypedContext()->ConsiderFlush(GpuFlushType::ImplicitWeakHint);
+          GetTypedContext()->ConsiderFlush(BlessedFlush::ChunkHint()); // blessed: gpu-gaps, BLESSED_FLUSH
 
         // We must record this command after the potential
         // flush since the caller may still access the data

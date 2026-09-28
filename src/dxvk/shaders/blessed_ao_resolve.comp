@@ -1,0 +1,115 @@
+// blessed: BLESSED_AO=rt pass 3/3 -- depth-aware upsample into the x channel of skyrim's sao texture
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "blessed_ao_common.glsl"
+
+layout(set = 1, binding = 0)
+uniform texture2D s_depth;
+
+layout(set = 1, binding = 1)
+uniform texture2D s_accum;
+
+layout(set = 1, binding = 2)
+uniform texture2D s_geo;
+
+layout(set = 1, binding = 3)
+uniform texture2D s_blurred;
+
+// blessed: the game's sao texture (rgba8). The composite reads only x;
+// y/z/w are kept as vanilla wrote them (read-modify-write, explicit rgba8,
+// same as the shadow mask)
+layout(set = 1, binding = 4, rgba8)
+uniform image2D s_output;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec4 fetch(texture2D t, ivec2 c) {
+  return texelFetch(sampler2D(t, s_samplers[pc.samplerIndex]), c, 0);
+}
+
+float source(ivec2 t, uint mode) {
+  if (mode == BLESSED_AO_DEBUG_NONE)
+    return fetch(s_blurred, t).x;
+  if (mode == BLESSED_AO_DEBUG_NOBLUR)
+    return unpackAo(fetch(s_accum, t).x);
+  return fetch(s_geo, t).w;
+}
+
+void main() {
+  BlessedAoConstants k = BlessedAoConstants(pc.constantsAddress);
+
+  ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+  if (q.x >= int(k.fullWidth) || q.y >= int(k.fullHeight))
+    return;
+
+  vec4 texel = imageLoad(s_output, q);
+
+  // blessed: BLESSED_AO_DEBUG=black|white -- the proof views. Whole
+  // texture, sky included, no rays needed
+  if (k.debugMode == BLESSED_AO_DEBUG_BLACK || k.debugMode == BLESSED_AO_DEBUG_WHITE) {
+    texel.x = k.debugMode == BLESSED_AO_DEBUG_WHITE ? 1.0 : 0.0;
+    imageStore(s_output, q, texel);
+    return;
+  }
+
+  float depth = texelFetch(sampler2D(s_depth, s_samplers[pc.samplerIndex]), q, 0).r;
+  if (depth == k.farDepthValue) {
+    texel.x = 1.0;
+    imageStore(s_output, q, texel);
+    return;
+  }
+
+  vec3 p = unproject(k.invViewProj, q, depth, vec2(k.fullWidth, k.fullHeight));
+  float dist = length(p);
+  float planeTol = 0.01 * dist + 1.0;
+
+  // blessed: trace texel t covers full-res pixels [t*s, t*s + s)
+  float s = float(k.traceScale);
+  vec2 tq = (vec2(q) + 0.5) / s - 0.5;
+  ivec2 base = ivec2(floor(tq));
+  vec2 f = tq - vec2(base);
+  ivec2 maxT = ivec2(k.traceWidth, k.traceHeight) - 1;
+
+  float sum = 0.0, wsum = 0.0;
+  float nearestVal = 1.0, nearestErr = 1.0e30;
+
+  for (uint i = 0u; i < 4u; i++) {
+    ivec2 o = ivec2(i & 1u, i >> 1u);
+    ivec2 t = clamp(base + o, ivec2(0), maxT);
+
+    vec3 pt = fetch(s_accum, t).yzw;
+    if (dot(pt, pt) == 0.0)
+      continue;
+
+    vec3 nt = fetch(s_geo, t).xyz;
+    float v = source(t, k.debugMode);
+
+    float err = length(pt - p);
+    if (err < nearestErr) {
+      nearestErr = err;
+      nearestVal = v;
+    }
+
+    float wBil   = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y) + 1.0e-3;
+    float wPlane = clamp(1.0 - abs(dot(nt, p - pt)) / planeTol, 0.0, 1.0);
+    float w = wBil * wPlane * wPlane;
+
+    sum  += v * w;
+    wsum += w;
+  }
+
+  float ao = wsum > 1.0e-4 ? sum / wsum : nearestVal;
+
+  // blessed: strength scales the occlusion, never the debug views
+  if (k.debugMode == BLESSED_AO_DEBUG_NONE || k.debugMode == BLESSED_AO_DEBUG_NOBLUR)
+    ao = 1.0 - k.strength * (1.0 - ao);
+
+  texel.x = clamp(ao, 0.0, 1.0);
+  imageStore(s_output, q, texel);
+}

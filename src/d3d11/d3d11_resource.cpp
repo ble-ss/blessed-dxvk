@@ -115,6 +115,8 @@ namespace dxvk {
     Rc<DxvkDevice> dxvkDevice = m_device->GetDXVKDevice();
 
     {
+      m_device->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe
+
       D3D11ImmediateContext* context = m_device->GetContext();
       D3D10Multithread& multithread = context->GetMultithread();
       static bool s_errorShown = false;

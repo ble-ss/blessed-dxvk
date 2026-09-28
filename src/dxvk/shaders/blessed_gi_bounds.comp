@@ -1,0 +1,119 @@
+// blessed: gi bounds -- one workgroup per mesh, object-space aabb of the vertices its index range touches
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// blessed: raw device-address reads of the game's own buffers, as plain
+// uint words (no 16-bit storage extension): a uint16 index or a half
+// position component is picked out of the aligned word that holds it, so
+// neither address has to be 4-byte aligned.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer GiBoundsWords {
+  uint v[];
+};
+
+// blessed: one result slot, 8 floats: min.xyz, pad, max.xyz, serial (as
+// uint bits). The host polls the serial -- see BlessedGiState::pollBounds.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer GiBoundsResult {
+  float mn[3];
+  float pad;
+  float mx[3];
+  uint  serial;
+};
+
+layout(push_constant, scalar) uniform BlessedGiBoundsPushData {
+  uint64_t vbAddress;     // vb gpu address + binding offset + attribute offset
+  uint64_t ibAddress;     // ib gpu address + binding offset
+  uint64_t resultAddress; // this job's slot
+  uint     vbStride;
+  uint     vbFormatCode;  // 0 = rgb32f (rgba32f collapsed), 2 = rgba16f
+  uint     indexTypeCode; // 0 = uint16, 1 = uint32
+  uint     indexCount;
+  uint     startIndex;
+  int      baseVertex;
+  uint     vertexCount;   // vertices the vb holds past vbAddress; larger indices are skipped
+  uint     serial;
+} pc;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+shared vec3 s_mn[64];
+shared vec3 s_mx[64];
+
+uint loadWord(uint64_t byteAddress) {
+  GiBoundsWords w = GiBoundsWords(byteAddress & ~uint64_t(3));
+  return w.v[0];
+}
+
+uint fetchIndex(uint element) {
+  if (pc.indexTypeCode == 0u) {
+    uint64_t addr = pc.ibAddress + uint64_t(pc.startIndex + element) * 2ul;
+    uint word = loadWord(addr);
+    return (addr & 2ul) != 0ul ? (word >> 16u) : (word & 0xFFFFu);
+  }
+
+  uint64_t addr = pc.ibAddress + uint64_t(pc.startIndex + element) * 4ul;
+  return loadWord(addr);
+}
+
+float fetchHalf(uint64_t addr) {
+  uint word = loadWord(addr);
+  uint bits = (addr & 2ul) != 0ul ? (word >> 16u) : (word & 0xFFFFu);
+  return unpackHalf2x16(bits).x;
+}
+
+vec3 fetchPosition(uint vertex) {
+  uint64_t base = pc.vbAddress + uint64_t(vertex) * uint64_t(pc.vbStride);
+
+  if (pc.vbFormatCode == 2u)
+    return vec3(fetchHalf(base), fetchHalf(base + 2ul), fetchHalf(base + 4ul));
+
+  return vec3(
+    uintBitsToFloat(loadWord(base)),
+    uintBitsToFloat(loadWord(base + 4ul)),
+    uintBitsToFloat(loadWord(base + 8ul)));
+}
+
+void main() {
+  uint tid = gl_LocalInvocationIndex;
+
+  vec3 mn = vec3( 3.0e38);
+  vec3 mx = vec3(-3.0e38);
+
+  for (uint i = tid; i < pc.indexCount; i += 64u) {
+    int vertex = int(fetchIndex(i)) + pc.baseVertex;
+
+    if (vertex < 0 || uint(vertex) >= pc.vertexCount)
+      continue;
+
+    vec3 p = fetchPosition(uint(vertex));
+
+    // blessed: a nan or inf component would poison the reduction
+    if (any(isnan(p)) || any(isinf(p)))
+      continue;
+
+    mn = min(mn, p);
+    mx = max(mx, p);
+  }
+
+  s_mn[tid] = mn;
+  s_mx[tid] = mx;
+  barrier();
+
+  for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    if (tid < stride) {
+      s_mn[tid] = min(s_mn[tid], s_mn[tid + stride]);
+      s_mx[tid] = max(s_mx[tid], s_mx[tid + stride]);
+    }
+    barrier();
+  }
+
+  if (tid == 0u) {
+    GiBoundsResult r = GiBoundsResult(pc.resultAddress);
+    r.mn[0] = s_mn[0].x; r.mn[1] = s_mn[0].y; r.mn[2] = s_mn[0].z;
+    r.mx[0] = s_mx[0].x; r.mx[1] = s_mx[0].y; r.mx[2] = s_mx[0].z;
+    r.pad    = 0.0;
+    r.serial = pc.serial;
+  }
+}

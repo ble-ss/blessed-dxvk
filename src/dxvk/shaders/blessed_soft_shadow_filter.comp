@@ -1,0 +1,100 @@
+// blessed: BLESSED_SHADOW_SOFT pass 2/2 -- depth-aware (bilateral) spatial
+// blur over blessed_soft_shadow_trace.comp's accumulated visibility, to
+// hide the remaining 1-spp noise; writes the real shadow mask's x channel.
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+// blessed: pass 1's accumulated (visibility, camera-relative position / 64)
+// output; zero position = sky
+layout(set = 1, binding = 0)
+uniform texture2D s_accumIn;
+
+// blessed: the real shadow mask -- read-modify-write on the x channel only,
+// same convention as blessed_sun_shadow.comp
+// blessed: explicit rgba8. a formatless storage image read returned 0
+// (no shaderStorageImageReadWithoutFormat), so the read-modify-write
+// zeroed the mask's g/b/a channels every frame (vanilla-mask-1).
+layout(set = 1, binding = 1, rgba8)
+uniform image2D s_output;
+
+// blessed: BLESSED_SHADOW_DUMP debug path only, same layout as
+// blessed_sun_shadow.comp's BlessedShadowPixels
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedShadowPixels {
+  uint data[];
+};
+
+layout(push_constant, scalar) uniform BlessedSoftShadowPush {
+  uint64_t constantsAddress; // unused by this pass
+  uint64_t tlasAddress;      // unused by this pass
+  uint64_t debugAddress;
+  uint     width;
+  uint     height;
+  uint     samplerIndex;
+  uint     tlasValid;        // unused by this pass
+  uint     debugMode;        // 0 off, 7 hist, 8 reproj (BLESSED_SHADOW_DEBUG)
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float ACCUM_TO_POS = 64.0; // see blessed_soft_shadow_trace.comp
+
+// blessed: camera distance of an accum texel, 0 for sky
+float AccumDist(vec4 s) {
+  return length(s.yzw) * ACCUM_TO_POS;
+}
+
+void main() {
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(pc.width) || coord.y >= int(pc.height))
+    return;
+
+  vec4 center = texelFetch(sampler2D(s_accumIn, s_samplers[pc.samplerIndex]), coord, 0);
+  float centerDist = AccumDist(center);
+  float visibility;
+
+  if (pc.debugMode == 7u || pc.debugMode == 8u || centerDist == 0.0) {
+    // hist / reproj debug: pass the trace pass's code straight through,
+    // unblurred. sky / no-scene: nothing to filter against either.
+    visibility = center.x;
+  } else {
+    // blessed: 5x5 depth-aware box blur, weighted by how close each
+    // neighbor's distance is to the center pixel's (relative to the
+    // center's own distance, so it scales with scene depth)
+    float sumW = 0.0;
+    float sumV = 0.0;
+    ivec2 maxCoord = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+
+    for (int dy = -2; dy <= 2; dy++) {
+      for (int dx = -2; dx <= 2; dx++) {
+        ivec2 c = clamp(coord + ivec2(dx, dy), ivec2(0), maxCoord);
+        vec4 s = texelFetch(sampler2D(s_accumIn, s_samplers[pc.samplerIndex]), c, 0);
+        float sDist = AccumDist(s);
+        if (sDist == 0.0)
+          continue;
+
+        float w = exp(-abs(sDist - centerDist) / max(centerDist * 0.05, 1.0));
+        sumW += w;
+        sumV += w * s.x;
+      }
+    }
+
+    visibility = sumW > 0.0 ? sumV / sumW : center.x;
+  }
+
+  vec4 prev = imageLoad(s_output, coord);
+  prev.x = visibility;
+  imageStore(s_output, coord, prev);
+
+  if (uint64_t(pc.debugAddress) != 0ul) {
+    BlessedShadowPixels dump = BlessedShadowPixels(uint64_t(pc.debugAddress) + 16ul);
+    dump.data[coord.y * int(pc.width) + coord.x] = uint(round(clamp(visibility, 0.0, 1.0) * 255.0));
+  }
+}

@@ -7,3 +7,6 @@ option('build_id',     type : 'boolean', value : false)
 option('native_glfw',  type : 'feature', value : 'auto', description: 'Enable GLFW WSI for DXVK Native')
 option('native_sdl2',  type : 'feature', value : 'auto', description: 'Enable SDL2 WSI for DXVK Native')
 option('native_sdl3',  type : 'feature', value : 'auto', description: 'Enable SDL3 WSI for DXVK Native')
+# blessed: false compiles every BLESSED_PROBE_CALL/MapScope/DiscardSliceScope/
+# EmitBlockScope out entirely, so a headline build carries no probe code.
+option('blessed_probe', type : 'boolean', value : true, description: 'Build the blessed render-thread timing probe (util_blessed_probe)')

@@ -7,6 +7,9 @@
 
 #include "d3d11_device.h"
 #include "d3d11_shader.h"
+#include "blessed_shader_replace.h" // blessed: shader-replace
+
+#include "blessed_vrs.h" // blessed: vrs
 
 namespace dxvk {
 
@@ -228,6 +231,12 @@ namespace dxvk {
       GatherInterefaceInfo(pLinkage, pShaderBytecode, BytecodeLength);
 
     CreateIrShader(pDevice, ShaderKey, ModuleInfo, pShaderBytecode, BytecodeLength, Icb);
+
+    // blessed: vrs -- tag discard / depth-writing pixel shaders, before
+    // the shader can be bound anywhere. No-op unless BLESSED_VRS is set.
+    if (ShaderKey.stage() == VK_SHADER_STAGE_FRAGMENT_BIT)
+      BlessedVrsTagPixelShader(m_shader.ptr(), pShaderBytecode, BytecodeLength);
+
     pDevice->GetDXVKDevice()->registerShader(m_shader);
   }
 
@@ -260,6 +269,15 @@ namespace dxvk {
       m_buffer = pDevice->GetDXVKDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
       pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
+    }
+
+    // blessed: shader-replace -- a replaced shader keeps the vanilla name,
+    // which is the disk cache's key, so it bypasses the cache both ways
+    if (unlikely(BlessedShaderReplace::SkipDiskCache(ShaderKey))) {
+      Rc<D3D11ShaderConverter> converter = new D3D11ShaderConverter(ShaderKey,
+        ModuleInfo, pShaderBytecode, BytecodeLength, bool(m_buffer));
+      m_shader = new DxvkIrShader(ModuleInfo, std::move(converter));
+      return;
     }
 
     // Create actual shader converter

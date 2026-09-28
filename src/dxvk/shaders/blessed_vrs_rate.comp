@@ -1,0 +1,219 @@
+// blessed: vrs -- builds next frame's shading rate image for the lit pass from its colour and motion (fidelityfx variable shading, ported).
+//
+// One 8x8 workgroup per 16x16 rate tile, each thread one 2x2 coarse pixel,
+// base rates only (1x1, 1x2, 2x1, 2x2). A straight port of
+// VrsGenerateVrsImage for FFX_VARIABLESHADING_TILESIZE 16 from the
+// FidelityFX SDK (sdk/include/FidelityFX/gpu/vrs/ffx_variable_shading.h,
+// release-FSR3-3.0.4), with these changes:
+// - luminance comes from the lit pass's hdr colour, mapped to a display-like
+//   range with sqrt(l / (1 + l)), not from a tonemapped frame;
+// - motion comes as prevUV - currUV (skyrim's convention), converted to the
+//   ffx convention (current - previous, in pixels); the (1,0) sentinel and
+//   anything over half a screen count as no motion;
+// - the tile maximum uses shared atomics instead of subgroup max + and;
+// - a two-frame hysteresis: a tile goes coarse on an axis only when this
+//   frame and the last both asked for it, and back to 1x1 at once.
+//
+// FidelityFX SDK: Copyright (c) 2023 Advanced Micro Devices, Inc. All rights
+// reserved. Permission is hereby granted, free of charge, to any person
+// obtaining a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including without
+// limitation the rights to use, copy, modify, merge, publish, distribute,
+// sublicense, and/or sell copies of the Software, and to permit persons to
+// whom the Software is furnished to do so, subject to the following
+// conditions: The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software. THE
+// SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+#version 460
+
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+// blessed: the lit pass's slot 0 (rgba16f hdr colour) and slot 1 (rg16f
+// motion), both as the pass left them
+layout(set = 1, binding = 0)
+uniform texture2D s_color;
+
+layout(set = 1, binding = 1)
+uniform texture2D s_motion;
+
+// blessed: next frame's rate image, one texel per 16x16 tile
+layout(set = 1, binding = 2, r8ui)
+uniform writeonly uimage2D s_rateOut;
+
+// blessed: per tile, the rate this analysis asked for last frame
+layout(set = 1, binding = 3, r8ui)
+uniform uimage2D s_history;
+
+layout(push_constant, scalar) uniform BlessedVrsRatePush {
+  uint  width;
+  uint  height;
+  uint  samplerIndex;
+  float cutoff;        // ffx VarianceCutoff
+  float motionFactor;  // ffx MotionFactor
+  uint  flags;         // bit 0: hysteresis on, bit 1: history valid
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const int  THREADS_1D   = 8;
+const int  SAMPLES_1D   = THREADS_1D + 2;
+const uint SAMPLE_COUNT = uint(SAMPLES_1D * SAMPLES_1D);
+const uint THREAD_COUNT = uint(THREADS_1D * THREADS_1D);
+
+const uint RATE_1X = 0u;
+const uint RATE_2X = 1u;
+
+shared vec3  lds_variance[SAMPLE_COUNT];
+shared float lds_min[SAMPLE_COUNT];
+shared float lds_max[SAMPLE_COUNT];
+shared uint  lds_tileMax[3];
+
+uint MakeRate(uint x, uint y) {
+  return (x << 2u) | y;
+}
+
+ivec2 ClampPos(ivec2 p) {
+  return clamp(p, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1));
+}
+
+// ffx ReadMotionVec2D: current - previous, in pixels
+vec2 ReadMotionPx(ivec2 p) {
+  vec2 m = texelFetch(sampler2D(s_motion, s_samplers[pc.samplerIndex]), ClampPos(p), 0).xy;
+
+  if (any(isnan(m)) || any(greaterThan(abs(m), vec2(0.5))))
+    return vec2(0.0);
+
+  return -m * vec2(float(pc.width), float(pc.height));
+}
+
+// ffx ReadLuminance
+float ReadLuminance(ivec2 p) {
+  vec3 c = texelFetch(sampler2D(s_color, s_samplers[pc.samplerIndex]), ClampPos(p), 0).rgb;
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+
+  if (isnan(l) || l <= 0.0)
+    return 0.0;
+
+  l = min(l, 65504.0);
+  return sqrt(l / (1.0 + l));
+}
+
+// ffx VrsGetLuminance: where this pixel's content should be next frame,
+// if it keeps moving the way it moved this frame
+float VrsGetLuminance(ivec2 p) {
+  vec2 v = ReadMotionPx(p);
+  return ReadLuminance(ClampPos(p - ivec2(round(v))));
+}
+
+int VrsFlattenLdsOffset(ivec2 coord) {
+  coord += 1;
+  return coord.y * SAMPLES_1D + coord.x;
+}
+
+void main() {
+  uint gidx = gl_LocalInvocationIndex;
+
+  if (gidx < 3u)
+    lds_tileMax[gidx] = 0u;
+
+  ivec2 tileOffset = ivec2(gl_WorkGroupID.xy) * (THREADS_1D * 2);
+  ivec2 baseOffset = tileOffset + ivec2(-2, -2);
+
+  // sample source texture (using motion vectors)
+  for (uint index = gidx; index < SAMPLE_COUNT; index += THREAD_COUNT) {
+    ivec2 index2D = 2 * ivec2(int(index) % SAMPLES_1D, int(index) / SAMPLES_1D);
+
+    vec4 lum;
+    lum.x = VrsGetLuminance(baseOffset + index2D + ivec2(0, 0));
+    lum.y = VrsGetLuminance(baseOffset + index2D + ivec2(1, 0));
+    lum.z = VrsGetLuminance(baseOffset + index2D + ivec2(0, 1));
+    lum.w = VrsGetLuminance(baseOffset + index2D + ivec2(1, 1));
+
+    // compute the 2x1, 1x2 and 2x2 variance inside the 2x2 coarse pixel region
+    vec3 delta;
+    delta.x = max(abs(lum.x - lum.y), abs(lum.z - lum.w));
+    delta.y = max(abs(lum.x - lum.z), abs(lum.y - lum.w));
+
+    vec2 minmax = vec2(
+      min(min(min(lum.x, lum.y), lum.z), lum.w),
+      max(max(max(lum.x, lum.y), lum.z), lum.w));
+    delta.z = minmax.y - minmax.x;
+
+    // reduce variance value for fast moving pixels
+    float v = length(ReadMotionPx(baseOffset + index2D)) * pc.motionFactor;
+    delta -= v;
+    minmax.y -= v;
+
+    lds_variance[index] = delta;
+    lds_min[index] = minmax.x;
+    lds_max[index] = minmax.y;
+  }
+
+  barrier();
+
+  ivec2 threadUV = ivec2(gl_LocalInvocationID.xy);
+
+  // look at neighbouring coarse pixels, to combat burn in effect due to frame dependence
+  vec3 delta = lds_variance[VrsFlattenLdsOffset(threadUV)];
+
+  float minNeighbour = lds_min[VrsFlattenLdsOffset(threadUV + ivec2(0, -1))];
+  minNeighbour = min(minNeighbour, lds_min[VrsFlattenLdsOffset(threadUV + ivec2(-1, 0))]);
+  minNeighbour = min(minNeighbour, lds_min[VrsFlattenLdsOffset(threadUV + ivec2(0, 1))]);
+  minNeighbour = min(minNeighbour, lds_min[VrsFlattenLdsOffset(threadUV + ivec2(1, 0))]);
+  float dMin = max(0.0, lds_min[VrsFlattenLdsOffset(threadUV)] - minNeighbour);
+
+  float maxNeighbour = lds_max[VrsFlattenLdsOffset(threadUV + ivec2(0, -1))];
+  maxNeighbour = max(maxNeighbour, lds_max[VrsFlattenLdsOffset(threadUV + ivec2(-1, 0))]);
+  maxNeighbour = max(maxNeighbour, lds_max[VrsFlattenLdsOffset(threadUV + ivec2(0, 1))]);
+  maxNeighbour = max(maxNeighbour, lds_max[VrsFlattenLdsOffset(threadUV + ivec2(1, 0))]);
+  float dMax = max(0.0, maxNeighbour - lds_max[VrsFlattenLdsOffset(threadUV)]);
+
+  // assume higher luminance based on min & max values gathered from neighbouring pixels
+  delta = max(vec3(0.0), delta + dMin + dMax);
+
+  // blessed: tile maximum. Non-negative floats order like their bits.
+  atomicMax(lds_tileMax[0], floatBitsToUint(delta.x));
+  atomicMax(lds_tileMax[1], floatBitsToUint(delta.y));
+  atomicMax(lds_tileMax[2], floatBitsToUint(delta.z));
+
+  barrier();
+
+  if (gidx != 0u)
+    return;
+
+  vec3 d = vec3(
+    uintBitsToFloat(lds_tileMax[0]),
+    uintBitsToFloat(lds_tileMax[1]),
+    uintBitsToFloat(lds_tileMax[2]));
+
+  uint rate = MakeRate(RATE_1X, RATE_1X);
+
+  if (d.z < pc.cutoff) {
+    rate = MakeRate(RATE_2X, RATE_2X);
+  } else if (d.x > d.y) {
+    rate = MakeRate(RATE_1X, (d.y > pc.cutoff) ? RATE_1X : RATE_2X);
+  } else {
+    rate = MakeRate((d.x > pc.cutoff) ? RATE_1X : RATE_2X, RATE_1X);
+  }
+
+  ivec2 tile = ivec2(gl_WorkGroupID.xy);
+  uint applied = rate;
+
+  if ((pc.flags & 1u) != 0u) {
+    uint prev = ((pc.flags & 2u) != 0u) ? imageLoad(s_history, tile).x : 0u;
+    applied = MakeRate(min(rate >> 2u, prev >> 2u), min(rate & 3u, prev & 3u));
+  }
+
+  imageStore(s_history, tile, uvec4(rate));
+  imageStore(s_rateOut, tile, uvec4(applied));
+}

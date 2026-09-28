@@ -1,0 +1,81 @@
+// blessed: BLESSED_AO=rt pass 2/3 -- separable depth- and normal-aware blur at trace resolution
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "blessed_ao_common.glsl"
+
+// blessed: this frame's accumulation (positions; and the ao itself on the
+// horizontal pass)
+layout(set = 1, binding = 0)
+uniform texture2D s_accum;
+
+// blessed: normals from the trace pass
+layout(set = 1, binding = 1)
+uniform texture2D s_geo;
+
+// blessed: the horizontal pass's output (vertical pass only; the
+// horizontal pass binds the accumulation here too and ignores it)
+layout(set = 1, binding = 2)
+uniform texture2D s_src;
+
+layout(set = 1, binding = 3, rgba16f)
+uniform writeonly image2D s_out;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const int RADIUS = 4;
+
+vec4 fetch(texture2D t, ivec2 c) {
+  return texelFetch(sampler2D(t, s_samplers[pc.samplerIndex]), c, 0);
+}
+
+void main() {
+  BlessedAoConstants k = BlessedAoConstants(pc.constantsAddress);
+
+  ivec2 tc = ivec2(gl_GlobalInvocationID.xy);
+  if (tc.x >= int(k.traceWidth) || tc.y >= int(k.traceHeight))
+    return;
+
+  vec4 center = fetch(s_accum, tc);
+  vec3 pc3 = center.yzw;
+  if (dot(pc3, pc3) == 0.0) {
+    imageStore(s_out, tc, vec4(1.0));
+    return;
+  }
+
+  vec3 nc = fetch(s_geo, tc).xyz;
+  float dist = length(pc3);
+  float planeTol = 0.01 * dist + 1.0;
+
+  ivec2 dir = pc.passArg == 0u ? ivec2(1, 0) : ivec2(0, 1);
+  ivec2 maxC = ivec2(k.traceWidth, k.traceHeight) - 1;
+
+  float sum = 0.0, wsum = 0.0;
+
+  for (int i = -RADIUS; i <= RADIUS; i++) {
+    ivec2 t = clamp(tc + dir * i, ivec2(0), maxC);
+    vec3 pt = fetch(s_accum, t).yzw;
+    if (dot(pt, pt) == 0.0)
+      continue;
+
+    vec3 nt = fetch(s_geo, t).xyz;
+    float ao = pc.passArg == 0u ? unpackAo(fetch(s_accum, t).x) : fetch(s_src, t).x;
+
+    float wSpatial = exp(-float(i * i) / (2.0 * 2.5 * 2.5));
+    float wPlane   = clamp(1.0 - abs(dot(nc, pt - pc3)) / planeTol, 0.0, 1.0);
+    float wNormal  = pow(clamp(dot(nc, nt), 0.0, 1.0), 8.0);
+    float w = wSpatial * wPlane * wNormal;
+
+    sum  += ao * w;
+    wsum += w;
+  }
+
+  float center_ao = pc.passArg == 0u ? unpackAo(center.x) : fetch(s_src, tc).x;
+  float result = wsum > 1.0e-4 ? sum / wsum : center_ao;
+  imageStore(s_out, tc, vec4(result, 0.0, 0.0, 1.0));
+}

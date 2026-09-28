@@ -29,6 +29,9 @@
 #include "d3d11_texture.h"
 #include "d3d11_video.h"
 
+#include "blessed_threaded_context.h" // blessed: threaded-fe
+#include "blessed_shader_replace.h" // blessed: shader-replace
+
 #include "../wsi/wsi_window.h"
 
 #include "../util/util_shared_res.h"
@@ -56,10 +59,25 @@ namespace dxvk {
     m_initializer = new D3D11Initializer(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
     m_d3d10Device = new D3D10Device(this, m_context.ptr());
+
+    // blessed: threaded-fe -- the app gets the facade as its immediate
+    // context. (Is11on12Device cannot be asked here: the container's
+    // 11on12 member is constructed after this device.)
+    if (m_d3d11Options.blessedThreadedFrontEnd) {
+      m_blessedFrontEnd = new D3D11ThreadedContext(this, m_context.ptr(),
+        m_d3d11Options.blessedThreadedFrontEndLoopback);
+      m_blessedFrontEnd->AddRefPrivate();
+      g_blessedDeferRelease = true;
+    }
   }
   
   
   D3D11Device::~D3D11Device() {
+    // blessed: threaded-fe -- replay and join before the real context
+    // goes; releases from here on run at once
+    if (m_blessedFrontEnd)
+      std::exchange(m_blessedFrontEnd, nullptr)->ReleasePrivate();
+
     delete m_d3d10Device;
     m_context = nullptr;
     delete m_initializer;
@@ -687,6 +705,19 @@ namespace dxvk {
       uint32_t locationMask = 0;
       uint32_t bindingsDefined = 0;
 
+      // blessed: scene-capture reads this straight off the input layout at
+      // draw time, since dxvk's own attribute list no longer carries the
+      // semantic name that would let it find POSITION0 itself.
+      bool                blessedPositionFound = false;
+      DxvkVertexAttribute blessedPosition       = { };
+
+      // blessed: actor-skinning -- BLENDINDICES0/BLENDWEIGHT0, read the same
+      // way (see D3D11InputLayout::SetBlessedSkinning).
+      bool                blessedSkinIndicesFound = false;
+      bool                blessedSkinWeightsFound = false;
+      DxvkVertexAttribute blessedSkinIndices      = { };
+      DxvkVertexAttribute blessedSkinWeights      = { };
+
       std::array<DxvkVertexAttribute, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> attrList = { };
       std::array<DxvkVertexBinding,   D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> bindList = { };
 
@@ -725,6 +756,29 @@ namespace dxvk {
         }
 
         attrList.at(i) = attrib;
+
+        // blessed: first POSITION0 stream the shader actually consumes
+        if (!blessedPositionFound && entry != inputSignature.end()
+         && !std::strcmp(pInputElementDescs[i].SemanticName, "POSITION")
+         && pInputElementDescs[i].SemanticIndex == 0) {
+          blessedPositionFound = true;
+          blessedPosition      = attrib;
+        }
+
+        // blessed: actor-skinning -- first BLENDINDICES0/BLENDWEIGHT0 stream
+        if (!blessedSkinIndicesFound && entry != inputSignature.end()
+         && !std::strcmp(pInputElementDescs[i].SemanticName, "BLENDINDICES")
+         && pInputElementDescs[i].SemanticIndex == 0) {
+          blessedSkinIndicesFound = true;
+          blessedSkinIndices      = attrib;
+        }
+
+        if (!blessedSkinWeightsFound && entry != inputSignature.end()
+         && !std::strcmp(pInputElementDescs[i].SemanticName, "BLENDWEIGHT")
+         && pInputElementDescs[i].SemanticIndex == 0) {
+          blessedSkinWeightsFound = true;
+          blessedSkinWeights      = attrib;
+        }
 
         // Create vertex input binding description. The
         // stride is dynamic state in D3D11 and will be
@@ -772,10 +826,19 @@ namespace dxvk {
       if (!ppInputLayout)
         return S_FALSE;
 
-      *ppInputLayout = ref(
-        new D3D11InputLayout(this,
-          attrCount, attrList.data(),
-          bindCount, bindList.data()));
+      auto* inputLayout = new D3D11InputLayout(this,
+        attrCount, attrList.data(),
+        bindCount, bindList.data());
+
+      // blessed: stash after construction, unaffected by the attribute
+      // compaction above (it moves entries, never edits their contents).
+      if (blessedPositionFound)
+        inputLayout->SetBlessedPosition(blessedPosition);
+
+      if (blessedSkinIndicesFound && blessedSkinWeightsFound)
+        inputLayout->SetBlessedSkinning(blessedSkinIndices, blessedSkinWeights);
+
+      *ppInputLayout = ref(inputLayout);
       return S_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
@@ -1284,6 +1347,7 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11Device::CreateDeferredContext(
           UINT                        ContextFlags,
           ID3D11DeviceContext**       ppDeferredContext) {
+    blessed::FeScope blessedFeScope(blessed::FeCall::CreateDeferredContext); // blessed: threaded-fe census
     *ppDeferredContext = ref(new D3D11DeferredContext(this, m_dxvkDevice, ContextFlags));
     return S_OK;
   }
@@ -1830,21 +1894,45 @@ namespace dxvk {
   
   
   void STDMETHODCALLTYPE D3D11Device::GetImmediateContext(ID3D11DeviceContext** ppImmediateContext) {
+    blessed::FeScope blessedFeScope(blessed::FeCall::GetImmediateContext); // blessed: threaded-fe
+    if (unlikely(m_blessedFrontEnd != nullptr)) {
+      *ppImmediateContext = ref(m_blessedFrontEnd);
+      return;
+    }
+
     *ppImmediateContext = m_context.ref();
   }
 
 
   void STDMETHODCALLTYPE D3D11Device::GetImmediateContext1(ID3D11DeviceContext1** ppImmediateContext) {
+    blessed::FeScope blessedFeScope(blessed::FeCall::GetImmediateContext); // blessed: threaded-fe
+    if (unlikely(m_blessedFrontEnd != nullptr)) {
+      *ppImmediateContext = ref(m_blessedFrontEnd);
+      return;
+    }
+
     *ppImmediateContext = m_context.ref();
   }
   
   
   void STDMETHODCALLTYPE D3D11Device::GetImmediateContext2(ID3D11DeviceContext2** ppImmediateContext) {
+    blessed::FeScope blessedFeScope(blessed::FeCall::GetImmediateContext); // blessed: threaded-fe
+    if (unlikely(m_blessedFrontEnd != nullptr)) {
+      *ppImmediateContext = ref(m_blessedFrontEnd);
+      return;
+    }
+
     *ppImmediateContext = m_context.ref();
   }
   
   
   void STDMETHODCALLTYPE D3D11Device::GetImmediateContext3(ID3D11DeviceContext3** ppImmediateContext) {
+    blessed::FeScope blessedFeScope(blessed::FeCall::GetImmediateContext); // blessed: threaded-fe
+    if (unlikely(m_blessedFrontEnd != nullptr)) {
+      *ppImmediateContext = ref(m_blessedFrontEnd);
+      return;
+    }
+
     *ppImmediateContext = m_context.ref();
   }
   
@@ -2003,6 +2091,11 @@ namespace dxvk {
   bool D3D11Device::Is11on12Device() const {
     return m_container->Is11on12Device();
   }
+
+
+  void D3D11Device::BlessedDrainFrontEndSlow(blessed::FeDrain Reason) {
+    m_blessedFrontEnd->DrainFromDevice(Reason); // blessed: threaded-fe
+  }
   
   
   D3D_FEATURE_LEVEL D3D11Device::GetMaxFeatureLevel(const DxvkDevice& Device) {
@@ -2043,6 +2136,15 @@ namespace dxvk {
     const DxvkIrShaderCreateInfo& ModuleInfo) {
     if (!BytecodeLength || !pShaderBytecode)
       return E_INVALIDARG;
+
+    // blessed: shader-replace -- swap in replacement dxbc; ShaderKey (dedup,
+    // the fs.<hash> name every hook matches) stays the vanilla one
+    if (unlikely(BlessedShaderReplace::IsEnabled())) {
+      BlessedShaderReplace::Apply(this, ShaderKey, &pShaderBytecode, &BytecodeLength,
+        [&] (const DxvkShaderHash& key, const void* code, size_t size, D3D11CommonShader* out) {
+          return SUCCEEDED(CreateShaderModule(out, nullptr, key, code, size, ModuleInfo));
+        });
+    }
 
     // Ensure that the built-in hash is valid for the given binary.
     // Somewhat relevant for us because we use the hash as a way to
@@ -2094,12 +2196,33 @@ namespace dxvk {
     dxbc_spv::dxbc::Instruction icbOp = { };
 
     D3D11BindingMask bindingMask;
+    std::array<uint16_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> blessedCbvSize = { }; // blessed: cascade-cache
+    std::array<uint64_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> blessedCbvRegs = { }; // blessed: cascade-cache, cbN[r] read, r < 64
+    uint32_t blessedCbvWhole = 0u; // blessed: cascade-cache, slots read with a relative index or r >= 64
 
     while (parser) {
       auto op = parser.parseInstruction();
 
       if (!op)
         return E_INVALIDARG;
+
+      // blessed: cascade-cache -- which constant registers the shader reads
+      for (uint32_t i = 0; i < op.getSrcCount(); i++) {
+        const auto& src = op.getSrc(i);
+
+        if (src.getRegisterType() != dxbc_spv::dxbc::RegisterType::eCbv || src.getIndexDimensions() < 2u)
+          continue;
+
+        uint32_t slot = src.getIndex(0u);
+
+        if (slot >= blessedCbvRegs.size())
+          continue;
+
+        if (src.getIndexType(1u) != dxbc_spv::dxbc::IndexType::eImm32 || src.getIndex(1u) >= 64u)
+          blessedCbvWhole |= 1u << slot;
+        else
+          blessedCbvRegs[slot] |= 1ull << src.getIndex(1u);
+      }
 
       switch (op.getOpToken().getOpCode()) {
         case dxbc_spv::dxbc::OpCode::eCustomData: {
@@ -2115,6 +2238,10 @@ namespace dxvk {
         case dxbc_spv::dxbc::OpCode::eDclConstantBuffer: {
           uint32_t index = op.getDst(0u).getIndex(0u);
           bindingMask.setCbv(index);
+
+          // blessed: cascade-cache, sm5.0 and older: cbN[size] in vec4s
+          if (index < blessedCbvSize.size() && !op.getOpToken().getCbvDynamicIndexingFlag())
+            blessedCbvSize[index] = uint16_t(std::min(op.getDst(0u).getIndex(1u), 4096u));
         } break;
 
         case dxbc_spv::dxbc::OpCode::eDclResource:
@@ -2247,6 +2374,9 @@ namespace dxvk {
 
     if (FAILED(hr))
       return hr;
+
+    commonShader.BlessedSetCbvSizes(blessedCbvSize); // blessed: cascade-cache
+    commonShader.BlessedSetCbvRegs(blessedCbvRegs, blessedCbvWhole); // blessed: cascade-cache
 
     *pShaderModule = std::move(commonShader);
     return S_OK;
@@ -3578,6 +3708,10 @@ namespace dxvk {
       auto marker = VkLatencyMarkerNV(MarkerType);
       m_tracker->setLatencyMarker(FrameId, marker);
 
+      // blessed: threaded-fe -- the ordered injects below go after every draw so far
+      if (marker == VK_LATENCY_MARKER_RENDERSUBMIT_START_NV || marker == VK_LATENCY_MARKER_RENDERSUBMIT_END_NV)
+        m_device->BlessedDrainFrontEnd(blessed::FeDrain::Device);
+
       if (marker == VK_LATENCY_MARKER_RENDERSUBMIT_START_NV) {
         m_device->GetContext()->InjectCs(DxvkCsQueue::Ordered, [
           cTracker  = m_tracker,
@@ -4143,6 +4277,12 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D11DXGIDevice::EnqueueSetEvent(HANDLE hEvent) {
+    // blessed: threaded-fe -- through the facade, so it lands after every recorded call
+    if (unlikely(m_d3d11Device.BlessedFrontEnd() != nullptr)) {
+      m_d3d11Device.BlessedFrontEnd()->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
+      return S_OK;
+    }
+
     auto immediateContext = m_d3d11Device.GetContext();
     immediateContext->Flush1(D3D11_CONTEXT_TYPE_ALL, hEvent);
     return S_OK;            

@@ -1,0 +1,161 @@
+// blessed: ray-traced sun shadow mask -- one ray query per pixel against the scene tlas
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// blessed: global sampler heap, fixed set/binding convention (see dxvk_mipgen.comp,
+// DxvkPipelineLayoutFlag::UsesSamplerHeap)
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+// blessed: our own two bindings -- depth (sampled) and the shadow-mask target (storage,
+// format left unspecified: relies on shaderStorageImage{Read,Write}WithoutFormat, gated
+// on the device side before this pipeline is ever built)
+layout(set = 1, binding = 0)
+uniform texture2D s_depth;
+
+// blessed: explicit rgba8. a formatless storage image read returned 0
+// (no shaderStorageImageReadWithoutFormat), so the read-modify-write
+// zeroed the mask's g/b/a channels every frame (vanilla-mask-1).
+layout(set = 1, binding = 1, rgba8)
+uniform image2D s_output;
+
+// blessed: BLESSED_SHADOW_DUMP debug path only. One buffer holds both: a
+// 16-byte counters header, then one uint per pixel (only the low byte is
+// meaningful) starting right after it. Both null unless a dump was
+// requested for this frame -- see BlessedShadowObjects::dispatch.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedShadowCounters {
+  uint sky;
+  uint lit;
+  uint shadowed;
+  uint _pad;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedShadowPixels {
+  uint data[];
+};
+
+layout(push_constant, scalar) uniform BlessedShadowPushData {
+  mat4                   invViewProj;   // CameraViewProjInverse, row-major as stored (see host-side note)
+  uint64_t               tlasAddress;
+  BlessedShadowCounters  debug;         // may be a null reference; guarded below
+  vec3                   camDelta;      // camPosAdjust(now) - camPosAdjust(tlas build)
+  vec3                   sunDir;        // unit vector toward the sun, world space
+  float                  farDepthValue; // depth value treated as sky (0 or 1, reversed-z dependent)
+  uint                   width;
+  uint                   height;
+  uint                   tlasValid;
+  uint                   samplerIndex;
+  uint                   debugMode;   // 0 off, 1 distance rings, 2 hit distance
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// blessed: read-modify-write on the x channel only -- the mask may carry other
+// terms (contact shadows, translucency) in y/z/w that this pass must not touch
+void writeVisibility(ivec2 coord, float visibility) {
+  vec4 prev = imageLoad(s_output, coord);
+  // blessed: debug 6 -- other channels forced to 1 (bottom-band test)
+  if (pc.debugMode == 6u)
+    prev.yzw = vec3(1.0);
+  prev.x = visibility;
+  imageStore(s_output, coord, prev);
+
+  if (uint64_t(pc.debug) != 0ul) {
+    BlessedShadowPixels dump = BlessedShadowPixels(uint64_t(pc.debug) + 16ul);
+    dump.data[coord.y * int(pc.width) + coord.x] = uint(round(clamp(visibility, 0.0, 1.0) * 255.0));
+  }
+}
+
+void main() {
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(pc.width) || coord.y >= int(pc.height))
+    return;
+
+  // blessed: debug 7 -- dump skyrim's own (raster) mask value unchanged,
+  // the ground truth to compare the traced mask against
+  if (pc.debugMode == 7u) {
+    writeVisibility(coord, imageLoad(s_output, coord).x);
+    return;
+  }
+
+  float depth = texelFetch(sampler2D(s_depth, s_samplers[pc.samplerIndex]), coord, 0).r;
+
+  // sky: nothing to shade, leave the mask fully lit and move on
+  if (depth == pc.farDepthValue) {
+    writeVisibility(coord, 1.0);
+    if (uint64_t(pc.debug) != 0ul)
+      atomicAdd(pc.debug.sky, 1u);
+    return;
+  }
+
+  if (pc.tlasValid == 0u) {
+    // no scene yet (first frames after enable): fully lit rather than fully shadowed
+    writeVisibility(coord, 1.0);
+    if (uint64_t(pc.debug) != 0ul)
+      atomicAdd(pc.debug.lit, 1u);
+    return;
+  }
+
+  // d3d viewport conventions: uv in [0,1], ndc.x = 2u-1, ndc.y = 1-2v
+  vec2 uv = (vec2(coord) + 0.5) / vec2(pc.width, pc.height);
+  vec4 ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+
+  // skyrim applies these as hlsl mul(M, v) on row_major bytes (community
+  // shaders: mul(FrameBuffer::CameraViewProj, pos)). the bytes land in a
+  // column-major glsl mat4 as M's transpose, so M * v is v * mat here.
+  vec4 viewPosH = ndc * pc.invViewProj;
+  vec3 camRelPos = viewPosH.xyz / viewPosH.w;
+
+  // the tlas was built from last frame's camera-relative transforms; shift this
+  // frame's camera-relative position into that frame's frame of reference
+  vec3 pTlas = camRelPos + pc.camDelta;
+
+  float dist = length(camRelPos);
+  float tMin = 0.01 * dist + 1.0;
+
+  rayQueryEXT rq;
+  rayQueryInitializeEXT(rq, accelerationStructureEXT(pc.tlasAddress),
+    gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+    pTlas, tMin, pc.sunDir, 100000.0);
+
+  while (rayQueryProceedEXT(rq)) { }
+
+  bool hit = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+  float visibility = hit ? 0.0 : 1.0;
+
+  // blessed: BLESSED_SHADOW_DEBUG views (written instead of visibility)
+  if (pc.debugMode == 1u)
+    visibility = fract(dist / 512.0);
+  else if (pc.debugMode == 2u)
+    visibility = hit ? clamp(rayQueryGetIntersectionTEXT(rq, true) / 2048.0, 0.0, 1.0) : 1.0;
+  else if (pc.debugMode == 4u || pc.debugMode == 5u) {
+    // blessed: alignment test -- a primary ray from the camera through this
+    // pixel against the tlas. aligned scene: hit t equals the depth
+    // buffer's distance. mode 4: |t - dist| / 64 (black = aligned, grey =
+    // off by that many units, white = off by 64+ or a miss). mode 5:
+    // t / dist * 0.5 (mid grey = aligned, darker = tlas geometry in front).
+    rayQueryEXT pq;
+    rayQueryInitializeEXT(pq, accelerationStructureEXT(pc.tlasAddress),
+      gl_RayFlagsOpaqueEXT, 0xFF, pc.camDelta, 0.0, normalize(camRelPos), 200000.0);
+    while (rayQueryProceedEXT(pq)) { }
+    bool phit = rayQueryGetIntersectionTypeEXT(pq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+    float pt = phit ? rayQueryGetIntersectionTEXT(pq, true) : 1.0e9;
+    visibility = pc.debugMode == 4u ? clamp(abs(pt - dist) / 64.0, 0.0, 1.0)
+                                    : clamp(pt / dist * 0.5, 0.0, 1.0);
+  }
+  else if (pc.debugMode == 3u)
+    visibility = hit ? float(min(rayQueryGetIntersectionInstanceIdEXT(rq, true) >> 2, 254)) / 255.0 : 1.0;
+
+  writeVisibility(coord, visibility);
+
+  if (uint64_t(pc.debug) != 0ul) {
+    if (hit) atomicAdd(pc.debug.shadowed, 1u);
+    else     atomicAdd(pc.debug.lit, 1u);
+  }
+}

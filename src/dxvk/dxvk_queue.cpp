@@ -1,6 +1,9 @@
 #include "dxvk_device.h"
 #include "dxvk_queue.h"
 
+#include "blessed/blessed_gpu_gaps.h" // blessed: gpu-gaps
+#include "blessed/blessed_present.h" // blessed: present-idle
+
 namespace dxvk {
   
   DxvkSubmissionQueue::DxvkSubmissionQueue(DxvkDevice* device, const DxvkQueueCallback& callback)
@@ -23,6 +26,12 @@ namespace dxvk {
       throw DxvkError(str::format("Failed to create timeline semaphores: ",
         vrGraphics > vrTransfer ? vrGraphics : vrTransfer));
     }
+
+    // blessed: async-compute -- the async queue's timeline, only if it exists
+    if (m_device->blessedHasAsyncQueue()) {
+      if (vk->vkCreateSemaphore(vk->device(), &semaphoreInfo, nullptr, &m_semaphores.blessedCompute))
+        throw DxvkError("Failed to create the blessed async compute timeline semaphore");
+    }
   }
   
   
@@ -41,6 +50,7 @@ namespace dxvk {
 
     vk->vkDestroySemaphore(vk->device(), m_semaphores.graphics, nullptr);
     vk->vkDestroySemaphore(vk->device(), m_semaphores.transfer, nullptr);
+    vk->vkDestroySemaphore(vk->device(), m_semaphores.blessedCompute, nullptr); // blessed: async-compute, null is fine
   }
   
   
@@ -83,6 +93,7 @@ namespace dxvk {
   void DxvkSubmissionQueue::synchronizeSubmission(
           DxvkSubmitStatus*   status) {
     std::unique_lock<dxvk::mutex> lock(m_mutex);
+    BlessedDeferWaiter blessedWaiter(m_blessedWaiters, m_appendCond); // blessed: present-idle
 
     m_submitCond.wait(lock, [status] {
       return status->result.load() != VK_NOT_READY;
@@ -92,6 +103,7 @@ namespace dxvk {
 
   void DxvkSubmissionQueue::synchronize() {
     std::unique_lock<dxvk::mutex> lock(m_mutex);
+    BlessedDeferWaiter blessedWaiter(m_blessedWaiters, m_appendCond); // blessed: present-idle
 
     m_submitCond.wait(lock, [this] {
       return m_submitQueue.empty();
@@ -101,6 +113,7 @@ namespace dxvk {
 
   void DxvkSubmissionQueue::waitForIdle() {
     std::unique_lock<dxvk::mutex> lock(m_mutex);
+    BlessedDeferWaiter blessedWaiter(m_blessedWaiters, m_appendCond); // blessed: present-idle
 
     m_submitCond.wait(lock, [this] {
       return m_submitQueue.empty();
@@ -134,8 +147,14 @@ namespace dxvk {
     uint64_t trackedSubmitId = 0u;
     uint64_t trackedPresentId = 0u;
 
+    // blessed: present-idle -- BLESSED_PRESENT=defer lets the next command
+    // list go to the gpu before a queued present (at most one per present)
+    const bool blessedDefer = BlessedPresent::Mode() == BlessedPresentMode::Defer;
+    bool blessedDeferred = false;
+
     while (!m_stopped.load()) {
       DxvkSubmitEntry entry;
+      size_t blessedIndex = 0u; // blessed: present-idle
 
       { std::unique_lock<dxvk::mutex> lock(m_mutex);
 
@@ -146,7 +165,15 @@ namespace dxvk {
         if (m_stopped.load())
           return;
 
-        entry = std::move(m_submitQueue.front());
+        // blessed: present-idle -- see blessedDeferPick
+        blessedIndex = unlikely(blessedDefer)
+          ? blessedDeferPick(lock, blessedDeferred)
+          : 0u;
+
+        if (m_stopped.load())
+          return;
+
+        entry = std::move(m_submitQueue.at(blessedIndex));
       }
 
       // Submit command buffer to device
@@ -171,9 +198,16 @@ namespace dxvk {
           if (entry.latency.tracker)
             entry.latency.tracker->notifyQueuePresentBegin(entry.latency.frameId);
 
+          uint64_t blessedT0 = BlessedGpuGaps::IsEnabled() ? BlessedGpuGaps::NowNs() : 0u; // blessed: gpu-gaps
+
           entry.result = entry.present.presenter->presentImage(
             entry.present.frameId, entry.latency.tracker,
             entry.present.rects.size(), entry.present.rects.data());
+
+          if (unlikely(BlessedGpuGaps::IsEnabled())) // blessed: gpu-gaps, present call time
+            BlessedGpuGaps::OnPresentCall(blessedT0, BlessedGpuGaps::NowNs());
+
+          blessedDeferred = false; // blessed: present-idle
 
           if (entry.latency.tracker) {
             entry.latency.tracker->notifyQueuePresentEnd(
@@ -214,7 +248,11 @@ namespace dxvk {
             m_device->waitForIdle();
         }
 
-        m_submitQueue.pop();
+        if (likely(!blessedIndex)) // blessed: present-idle
+          m_submitQueue.pop();
+        else
+          m_submitQueue.eraseAt(blessedIndex);
+
         m_submitCond.notify_all();
       }
 
@@ -254,14 +292,16 @@ namespace dxvk {
         VkResult status = m_lastError.load();
 
         if (status != VK_ERROR_DEVICE_LOST) {
-          std::array<VkSemaphore, 2> semaphores = { m_semaphores.graphics, m_semaphores.transfer };
-          std::array<uint64_t, 2> timelines = { entry.timelines.graphics, entry.timelines.transfer };
+          // blessed: async-compute -- a third entry: the list is done only
+          // when its async kicks are, too (they track what they read)
+          std::array<VkSemaphore, 3> semaphores = { m_semaphores.graphics, m_semaphores.transfer, m_semaphores.blessedCompute };
+          std::array<uint64_t, 3> timelines = { entry.timelines.graphics, entry.timelines.transfer, entry.timelines.blessedCompute };
 
           if (entry.latency.tracker)
             entry.latency.tracker->notifyGpuExecutionBegin(entry.latency.frameId);
 
           VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-          waitInfo.semaphoreCount = semaphores.size();
+          waitInfo.semaphoreCount = m_semaphores.blessedCompute ? 3u : 2u; // blessed: async-compute
           waitInfo.pSemaphores = semaphores.data();
           waitInfo.pValues = timelines.data();
 

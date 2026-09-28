@@ -520,6 +520,10 @@ namespace dxvk {
     if (state.feedbackLoop & VK_IMAGE_ASPECT_DEPTH_BIT)
       flags.flags |= VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
+    // blessed: vrs -- every library that knows the attachments carries it
+    if (m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      flags.flags |= VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
     if (m_device->canUseDescriptorHeap())
       flags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
 
@@ -808,6 +812,11 @@ namespace dxvk {
         dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT;
       }
     }
+
+    // blessed: vrs -- always dynamic, even with rasterizer discard, so no
+    // pipeline ever leaves the rate state undefined for the next draw
+    if (device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
 
     if (dyInfo.dynamicStateCount)
       dyInfo.pDynamicStates = dyStates.data();
@@ -1374,6 +1383,10 @@ namespace dxvk {
     VkPipelineCreateFlags2CreateInfo flags = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
     flags.flags = vs.linkFlags | fs.linkFlags;
 
+    // blessed: vrs -- the linked pipeline too, not only its libraries
+    if (m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      flags.flags |= VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
     if (m_device->canUseDescriptorHeap())
       flags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;
 
@@ -1465,6 +1478,10 @@ namespace dxvk {
       if (key.foState.feedbackLoop & VK_IMAGE_ASPECT_DEPTH_BIT)
         flags.flags |= VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     }
+
+    // blessed: vrs
+    if (m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate)
+      flags.flags |= VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
     if (m_device->canUseDescriptorHeap())
       flags.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT;

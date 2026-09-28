@@ -3,6 +3,9 @@
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 
+#include "blessed_scene_capture.h" // blessed: hook-cpu-2, bones allocation
+#include "blessed_cb_ring.h" // blessed: cb-ring
+
 namespace dxvk {
   
   D3D11Buffer::D3D11Buffer(
@@ -17,6 +20,7 @@ namespace dxvk {
     DxvkBufferCreateInfo info;
     info.flags  = 0;
     info.size   = pDesc->ByteWidth;
+    info.blessedDynamic = pDesc->Usage == D3D11_USAGE_DYNAMIC; // blessed: scene-cs
     info.usage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                 | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                 | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
@@ -24,16 +28,26 @@ namespace dxvk {
     info.access = VK_ACCESS_TRANSFER_READ_BIT
                 | VK_ACCESS_TRANSFER_WRITE_BIT;
     
+    // blessed: cached once per buffer; costs one branch on a bool the
+    // device already resolved at creation time, nothing when RT is off.
+    bool supportsRayQuery = m_parent->GetDXVKDevice()->supportsRayQuery();
+
     if (pDesc->BindFlags & D3D11_BIND_VERTEX_BUFFER) {
       info.usage  |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
       info.stages |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
       info.access |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+
+      if (supportsRayQuery)
+        info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR; // blessed
     }
-    
+
     if (pDesc->BindFlags & D3D11_BIND_INDEX_BUFFER) {
       info.usage  |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
       info.stages |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
       info.access |= VK_ACCESS_INDEX_READ_BIT;
+
+      if (supportsRayQuery)
+        info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR; // blessed
     }
     
     if (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) {
@@ -108,6 +122,22 @@ namespace dxvk {
       m_buffer = m_parent->GetDXVKDevice()->createBuffer(info, memoryFlags);
       m_cookie = m_buffer->cookie();
       m_mapPtr = m_buffer->mapPtr(0);
+
+      // blessed: hook-cpu-2 -- remember the mapped allocation of bones-
+      // shaped cbuffers only (see BlessedMappedAllocation)
+      if (unlikely(BlessedSceneCapture::IsBonesBufferDesc(m_desc))) {
+        m_blessedKeepAllocation = true;
+        m_blessedAllocation     = m_buffer->storage();
+      }
+
+      // blessed: cb-ring -- decided once here, see BlessedUsesCbRing
+      m_blessedCbRing = m_parent->GetOptions()->blessedCbRing
+        && m_desc.Usage == D3D11_USAGE_DYNAMIC
+        && m_desc.BindFlags == D3D11_BIND_CONSTANT_BUFFER
+        && !m_desc.MiscFlags
+        && m_desc.ByteWidth <= BlessedCbRing::MaxChunkSize
+        && (memoryFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+        && m_mapPtr && !m_blessedKeepAllocation;
     } else {
       m_sparseAllocator = m_parent->GetDXVKDevice()->createSparsePageAllocator();
       m_sparseAllocator->setCapacity(info.size / SparseMemoryPageSize);
@@ -120,6 +150,8 @@ namespace dxvk {
     // For Stream Output buffers we need a counter
     if (pDesc->BindFlags & D3D11_BIND_STREAM_OUTPUT)
       m_soCounter = CreateSoCounterBuffer();
+
+    m_blessedAppMapPtr = m_mapPtr; // blessed: threaded-fe
   }
   
   
@@ -358,6 +390,19 @@ namespace dxvk {
     
     bool useCached = (m_parent->GetOptions()->cachedDynamicResources == ~0u)
                   || (m_parent->GetOptions()->cachedDynamicResources & m_desc.BindFlags);
+
+    // blessed: traverse-passes -- a dynamic buffer bound only as vertex
+    // and/or index data (566c03f3's 4 MiB streaming vb, traverse-dump-2)
+    // still gets the app profile's cached-system-memory override same as any
+    // constant buffer, but its Map writes are one bulk streaming copy, not
+    // skyrim's small locked cbuffer stores -- so opt it back out and let it
+    // keep the DYNAMIC default (device-local, host-visible) computed above.
+    constexpr UINT BlessedVbIbOnly = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
+
+    if (useCached && m_parent->GetOptions()->blessedVbRebar
+     && (m_desc.BindFlags & BlessedVbIbOnly)
+     && !(m_desc.BindFlags & ~BlessedVbIbOnly))
+      useCached = false;
 
     if ((memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && useCached) {
       memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;

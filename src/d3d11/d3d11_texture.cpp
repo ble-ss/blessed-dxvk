@@ -3,6 +3,7 @@
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
 
+#include "../util/util_env.h"
 #include "../util/util_shared_res.h"
 #include "../util/util_win32_compat.h"
 
@@ -104,6 +105,27 @@ namespace dxvk {
       imageInfo.stages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
       imageInfo.access |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
                        |  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+      // blessed: the sun-shadow compute pass writes rtv 0 directly (read-
+      // modify-write on the x channel); only add the usage bit -- and only
+      // for formats that actually support it -- when that pass is enabled,
+      // so every other render target costs nothing (env var read once).
+      static const bool s_shadowPassEnabled =
+        env::getEnvVar("BLESSED_HOOK_MODE") == "rtshadow"
+        || env::getEnvVar("BLESSED_POINT_SHADOWS") == "1"; // blessed: point-lights write the same mask
+      // blessed: volumetrics writes pass 138's r16f target the same way
+      static const bool s_volEnabled =
+        env::getEnvVar("BLESSED_VOLUMETRICS") == "rt";
+
+      if (s_shadowPassEnabled || (s_volEnabled && formatInfo.Format == VK_FORMAT_R16_SFLOAT)) {
+        DxvkFormatFeatures support = pDevice->GetDXVKDevice()->getFormatFeatures(formatInfo.Format);
+
+        if (support.optimal & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) {
+          imageInfo.usage  |= VK_IMAGE_USAGE_STORAGE_BIT;
+          imageInfo.stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+          imageInfo.access |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        }
+      }
     }
     
     if (m_desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) {

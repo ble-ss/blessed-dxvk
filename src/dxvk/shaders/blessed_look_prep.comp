@@ -1,0 +1,111 @@
+// blessed: BLESSED_LOOK prep passes -- bless's bloom extract/blur and colour-spill extract/blur
+#version 460
+
+#extension GL_EXT_samplerless_texture_functions : require
+
+// blessed: a port of bless-shader's bloom_extract.fsh, bloom_vertical.fsh,
+// spill_extract.fsh and spill_blur.fsh (E:\toki-klak\bless-shader, head
+// 48ae0c9). bless samples with bilinear filtering and clamp-to-edge; this
+// pass has no sampler, so bilinear() below rebuilds that from 4 fetches.
+//
+// mode 0: bloom bright pass + horizontal 9-tap (full-res source -> half res)
+// mode 1: plain 9-tap along offsetUv (bloom vertical, spill blur h/v)
+// mode 2: spill extract, 4-tap box of the saturation-keyed pass (-> quarter res)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D s_src;
+// blessed: explicit format -- formatless storage access is not enabled on
+// this device (see blessed_soft_shadow_filter.comp)
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D s_dst;
+
+layout(push_constant) uniform PushData {
+  ivec2 srcSize;
+  ivec2 dstSize;
+  vec2  offsetUv;    // one tap step, in source uv
+  int   mode;
+  float threshold;   // bloom: bloom_threshold; spill: spill_threshold
+  float knee;        // bloom: 0.35; spill: 0.25 (smoothstep width)
+  float surface;     // bloom: bright-surface weight (0.10)
+  float haze;        // bloom: whole-frame haze weight (0.10)
+  float pad;
+} pc;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+vec3 fetchClamped(ivec2 p) {
+  return texelFetch(s_src, clamp(p, ivec2(0), pc.srcSize - 1), 0).rgb;
+}
+
+// clamp-to-edge bilinear, the same result as texture() on a linear sampler
+vec3 bilinear(vec2 uv) {
+  vec2 p = uv * vec2(pc.srcSize) - 0.5;
+  vec2 f = fract(p);
+  ivec2 i = ivec2(floor(p));
+  vec3 a = fetchClamped(i);
+  vec3 b = fetchClamped(i + ivec2(1, 0));
+  vec3 c = fetchClamped(i + ivec2(0, 1));
+  vec3 d = fetchClamped(i + ivec2(1, 1));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// mode 1 only: source and target are the same size and the taps step
+// along one axis, so the other coordinate sits on a texel centre and the
+// bilinear fetch needs two texels, not four
+vec3 axisBilinear(vec2 uv) {
+  vec2 p = uv * vec2(pc.srcSize) - 0.5;
+  bool alongX = pc.offsetUv.x != 0.0;
+  float t = alongX ? p.x : p.y;
+  float f = fract(t);
+  ivec2 i = ivec2(round(p));
+  ivec2 step = alongX ? ivec2(1, 0) : ivec2(0, 1);
+  if (alongX) i.x = int(floor(t)); else i.y = int(floor(t));
+  return mix(fetchClamped(i), fetchClamped(i + step), f);
+}
+
+// bloom_extract.fsh brightPass: surface * smoothstep(T, T + knee, l) + haze
+vec3 tapColor(vec2 uv) {
+  if (pc.mode == 1)
+    return axisBilinear(uv);
+
+  vec3 c = bilinear(uv);
+  float l = dot(c, LUMA);
+  return c * (smoothstep(pc.threshold, pc.threshold + pc.knee, l) * pc.surface + pc.haze);
+}
+
+// spill_extract.fsh spillPass: keyed on max channel and saturation, not luma
+vec3 spillPass(vec2 uv) {
+  vec3 c = bilinear(uv);
+  float m = max(c.r, max(c.g, c.b));
+  float sat = m - min(c.r, min(c.g, c.b));
+  return c * smoothstep(pc.threshold, pc.threshold + pc.knee, m) * (0.15 + sat);
+}
+
+void main() {
+  ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(pix, pc.dstSize)))
+    return;
+
+  vec2 uv = (vec2(pix) + 0.5) / vec2(pc.dstSize);
+  vec3 sum;
+
+  if (pc.mode == 2) {
+    vec2 texel = 1.0 / vec2(pc.srcSize);
+    sum = spillPass(uv + vec2(-1.0, -1.0) * texel)
+        + spillPass(uv + vec2( 1.0, -1.0) * texel)
+        + spillPass(uv + vec2(-1.0,  1.0) * texel)
+        + spillPass(uv + vec2( 1.0,  1.0) * texel);
+    sum *= 0.25;
+  } else {
+    vec2 o = pc.offsetUv;
+    sum = tapColor(uv) * 0.227027;
+    sum += (tapColor(uv + o)       + tapColor(uv - o))       * 0.194594;
+    sum += (tapColor(uv + o * 2.0) + tapColor(uv - o * 2.0)) * 0.121621;
+    sum += (tapColor(uv + o * 3.0) + tapColor(uv - o * 3.0)) * 0.054054;
+    sum += (tapColor(uv + o * 4.0) + tapColor(uv - o * 4.0)) * 0.016216;
+  }
+
+  // bless's intermediates are rgba8_unorm: clamp the same way (the 16f
+  // storage here only removes the 1/255 banding in the faint haze)
+  imageStore(s_dst, pix, vec4(clamp(sum, 0.0, 1.0), 1.0));
+}

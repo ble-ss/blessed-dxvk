@@ -1,0 +1,171 @@
+// blessed: ray-traced point-light shadow -- one ray per pixel toward one light, written into that light's mask channel(s)
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+layout(set = 1, binding = 0)
+uniform texture2D s_depth;
+
+// blessed: explicit rgba8, as the sun pass (a formatless read returns 0)
+layout(set = 1, binding = 1, rgba8)
+uniform image2D s_output;
+
+// blessed: BLESSED_POINT_DUMP only -- 16-byte counters, then one uint per pixel
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedPointCounters {
+  uint culled;    // beyond the light's radius, or sky
+  uint lit;
+  uint shadowed;
+  uint _pad;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedPointPixels {
+  uint data[];
+};
+
+// blessed: 128 bytes, must match BlessedPointShadowPushData in blessed_point_shadow.cpp
+layout(push_constant, scalar) uniform BlessedPointShadowPushData {
+  mat4                  invViewProj;   // CameraViewProjInverse, row-major as stored
+  uint64_t              tlasAddress;
+  BlessedPointCounters  debug;         // may be a null reference
+  vec3                  camDelta;      // camPosAdjust(now) - camPosAdjust(tlas build)
+  vec3                  lightPos;      // camera-relative light origin (this frame)
+  float                 radius;        // cull radius, 0 = none
+  float                 proxyRadius;   // tMax = distance - proxyRadius
+  float                 farDepthValue;
+  uint                  extent;        // width | height << 16
+  uint                  samplerIndex;
+  uint                  flags;         // bits 0-3 channel mask, bit 4 tlas valid, bits 8-15 debug mode
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// blessed: read-modify-write of this light's channel(s) only; the other
+// channels belong to the sun and the other lights
+void writeVisibility(ivec2 coord, uint width, float visibility) {
+  uint mask = pc.flags & 0xFu;
+  vec4 prev = imageLoad(s_output, coord);
+  vec4 next = vec4(
+    (mask & 1u) != 0u ? visibility : prev.x,
+    (mask & 2u) != 0u ? visibility : prev.y,
+    (mask & 4u) != 0u ? visibility : prev.z,
+    (mask & 8u) != 0u ? visibility : prev.w);
+  imageStore(s_output, coord, next);
+
+  if (uint64_t(pc.debug) != 0ul) {
+    BlessedPointPixels dump = BlessedPointPixels(uint64_t(pc.debug) + 16ul);
+    dump.data[coord.y * int(width) + coord.x] = uint(round(clamp(visibility, 0.0, 1.0) * 255.0));
+  }
+}
+
+void main() {
+  uint width  = pc.extent & 0xFFFFu;
+  uint height = pc.extent >> 16;
+  uint debugMode = (pc.flags >> 8) & 0xFFu;
+
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(width) || coord.y >= int(height))
+    return;
+
+  // blessed: debug 6 (raster) -- the engine's own value, unchanged: the
+  // ground truth for BLESSED_POINT_DUMP
+  if (debugMode == 6u) {
+    vec4 own = imageLoad(s_output, coord);
+    uint mask = pc.flags & 0xFu;
+    float v = (mask & 1u) != 0u ? own.x : (mask & 2u) != 0u ? own.y : (mask & 4u) != 0u ? own.z : own.w;
+    writeVisibility(coord, width, v);
+    return;
+  }
+
+  // blessed: debug 1 (lit) / 2 (dark) -- proves the hook and the channel
+  // without a single ray: the light loses its shadows / goes out entirely
+  if (debugMode == 1u || debugMode == 2u) {
+    writeVisibility(coord, width, debugMode == 1u ? 1.0 : 0.0);
+    return;
+  }
+
+  float depth = texelFetch(sampler2D(s_depth, s_samplers[pc.samplerIndex]), coord, 0).r;
+
+  if (depth == pc.farDepthValue) {
+    writeVisibility(coord, width, 1.0);
+    if (uint64_t(pc.debug) != 0ul)
+      atomicAdd(pc.debug.culled, 1u);
+    return;
+  }
+
+  vec2 uv = (vec2(coord) + 0.5) / vec2(width, height);
+  vec4 ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+  vec4 viewPosH = ndc * pc.invViewProj;
+  vec3 camRelPos = viewPosH.xyz / viewPosH.w;
+
+  vec3 toLight = pc.lightPos - camRelPos;
+  float lightDist = length(toLight);
+
+  // blessed: debug 3 (rings) -- 64-unit rings centred on the solved origin;
+  // debug 4 (radius) -- white inside the radius, black outside
+  if (debugMode == 3u) {
+    writeVisibility(coord, width, fract(lightDist / 64.0));
+    return;
+  }
+  if (debugMode == 4u) {
+    writeVisibility(coord, width, (pc.radius <= 0.0 || lightDist <= pc.radius) ? 1.0 : 0.0);
+    return;
+  }
+
+  // beyond the light's reach: the lit shader zeroes it there anyway
+  if (pc.radius > 0.0 && lightDist > pc.radius) {
+    writeVisibility(coord, width, 1.0);
+    if (uint64_t(pc.debug) != 0ul)
+      atomicAdd(pc.debug.culled, 1u);
+    return;
+  }
+
+  if ((pc.flags & 0x10u) == 0u) {
+    // no scene yet: fully lit rather than fully shadowed
+    writeVisibility(coord, width, 1.0);
+    if (uint64_t(pc.debug) != 0ul)
+      atomicAdd(pc.debug.lit, 1u);
+    return;
+  }
+
+  float camDist = length(camRelPos);
+  float tMin = 0.01 * camDist + 1.0;
+  float tMax = lightDist - pc.proxyRadius;
+
+  bool hit = false;
+  float hitT = 0.0;
+
+  if (tMax > tMin) {
+    vec3 dir = toLight / lightDist;
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, accelerationStructureEXT(pc.tlasAddress),
+      gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+      camRelPos + pc.camDelta, tMin, dir, tMax);
+
+    while (rayQueryProceedEXT(rq)) { }
+
+    hit = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+    if (hit)
+      hitT = rayQueryGetIntersectionTEXT(rq, true);
+  }
+
+  float visibility = hit ? 0.0 : 1.0;
+
+  // blessed: debug 5 (t) -- hit distance over the light distance, 1 = lit
+  if (debugMode == 5u)
+    visibility = hit ? clamp(hitT / max(lightDist, 1.0), 0.0, 1.0) : 1.0;
+
+  writeVisibility(coord, width, visibility);
+
+  if (uint64_t(pc.debug) != 0ul) {
+    if (hit) atomicAdd(pc.debug.shadowed, 1u);
+    else     atomicAdd(pc.debug.lit, 1u);
+  }
+}

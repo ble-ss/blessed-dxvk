@@ -5,6 +5,8 @@
 
 #include "../util/com/com_private_data.h"
 
+#include "blessed_threaded_release.h" // blessed: threaded-fe
+
 namespace dxvk {
 
   class D3D11Device;
@@ -96,10 +98,19 @@ namespace dxvk {
       uint32_t refCount = --this->m_refCount;
       if (unlikely(!refCount)) {
         auto* parent = this->GetParentInterface();
-        this->ReleasePrivate();
+        // blessed: threaded-fe -- the private release waits behind the ring
+        if (likely(!g_blessedDeferRelease) || !BlessedDeferRelease(this->m_parent, this, &BlessedReleasePrivate))
+          this->ReleasePrivate();
         parent->Release();
       }
       return refCount;
+    }
+
+  private:
+
+    // blessed: threaded-fe
+    static void BlessedReleasePrivate(void* pObject) {
+      static_cast<D3D11DeviceChild*>(pObject)->ReleasePrivate();
     }
     
   };
@@ -135,11 +146,18 @@ namespace dxvk {
 
       if (unlikely(!refCount)) {
         ID3D11Device* device = this->GetParentInterface();
-        ReleasePrivate();
+        // blessed: threaded-fe -- the private release waits behind the ring
+        if (likely(!g_blessedDeferRelease) || !BlessedDeferRelease(this->m_parent, this, &BlessedReleasePrivate))
+          ReleasePrivate();
         device->Release();
       }
 
       return refCount;
+    }
+
+    // blessed: threaded-fe
+    static void BlessedReleasePrivate(void* pObject) {
+      static_cast<D3D11StateObject*>(pObject)->ReleasePrivate();
     }
 
     void AddRefPrivate() {

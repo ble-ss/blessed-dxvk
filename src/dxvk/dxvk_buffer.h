@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic> // blessed: perf-halfrate
 #include <unordered_map>
 #include <vector>
 
@@ -38,6 +39,11 @@ namespace dxvk {
 
     /// Debug name.
     const char* debugName = nullptr;
+
+    // blessed: scene-cs -- true for a D3D11_USAGE_DYNAMIC buffer, so scene
+    // capture can reject dynamic vertex/index buffers on the cs thread.
+    // Informational only, never passed to vulkan.
+    bool blessedDynamic = false;
   };
 
 
@@ -323,6 +329,58 @@ namespace dxvk {
       return result;
     }
 
+    // blessed: cb-ring -- allocates storage like allocateStorage, with this
+    // buffer's usage and memory properties, but \p size bytes long. Used
+    // for the constant-buffer ring blocks (src/d3d11/blessed_cb_ring.h).
+    Rc<DxvkResourceAllocation> blessedAllocateStorage(VkDeviceSize size) {
+      return blessedAllocateStorage(size, m_properties);
+    }
+
+    // blessed: perf-halfrate -- the same, with explicit memory properties
+    // (the ring's device-local blocks, d3d11.blessedCbRingDeviceLocal)
+    Rc<DxvkResourceAllocation> blessedAllocateStorage(VkDeviceSize size, VkMemoryPropertyFlags properties) {
+      DxvkAllocationInfo allocationInfo = { };
+      allocationInfo.resourceCookie = cookie();
+      allocationInfo.properties = properties;
+
+      VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+      info.flags = m_info.flags;
+      info.usage = m_info.usage;
+      info.size = size;
+      m_sharingMode.fill(info);
+
+      return m_allocator->createBufferResource(info, allocationInfo, nullptr);
+    }
+
+    // blessed: cb-ring -- assignStorage onto a sub-range of a shared ring
+    // block: \p offset bytes into \p block, this buffer's own size long.
+    // Everything that reads the buffer through getSliceInfo / mapPtr /
+    // the gpu address sees the chunk. Only for mapped, uniform-only
+    // buffers (no views, never relocated, no residency tracking).
+    // blessed: cb-mirror -- \p block may now be a device-local, unmapped
+    // mirror (d3d11.blessedCbMirror): mapPtr is null there, guarded below
+    // rather than assumed mapped. Only ever read by a buffer this ring
+    // never renames onto a mirror (DxvkBuffer::blessedCpuRead).
+    Rc<DxvkResourceAllocation> blessedAssignStorageRange(
+      const Rc<DxvkResourceAllocation>& block,
+            VkDeviceSize                offset) {
+      Rc<DxvkResourceAllocation> result = std::move(m_storage);
+
+      m_storage = block;
+      m_bufferInfo = m_storage->getBufferInfo();
+      m_bufferInfo.offset += offset;
+      m_bufferInfo.size = m_info.size;
+      m_bufferInfo.mapPtr = m_bufferInfo.mapPtr
+        ? reinterpret_cast<char*>(m_bufferInfo.mapPtr) + offset
+        : nullptr;
+
+      if (m_bufferInfo.gpuAddress)
+        m_bufferInfo.gpuAddress += offset;
+
+      m_version += 1u;
+      return result;
+    }
+
     /**
      * \brief Retrieves current backing storage
      * \returns Current buffer allocation
@@ -397,6 +455,17 @@ namespace dxvk {
       return m_debugName.c_str();
     }
 
+    // blessed: perf-halfrate -- a hook reads this buffer's mapped bytes on
+    // the cpu, so the cb ring keeps its chunks in cached memory. Any thread.
+    void blessedMarkCpuRead() {
+      if (!m_blessedCpuRead.load(std::memory_order_relaxed))
+        m_blessedCpuRead.store(true, std::memory_order_relaxed);
+    }
+
+    bool blessedCpuRead() const {
+      return m_blessedCpuRead.load(std::memory_order_relaxed);
+    }
+
   private:
 
     Rc<vk::DeviceFn>            m_vkd;
@@ -420,6 +489,8 @@ namespace dxvk {
       DxvkBufferView, DxvkHash, DxvkEq> m_views;
 
     std::string                 m_debugName;
+
+    std::atomic<bool>           m_blessedCpuRead = { false }; // blessed: perf-halfrate
 
     void updateDebugName();
 

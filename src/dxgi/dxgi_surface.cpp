@@ -31,6 +31,12 @@ namespace dxvk {
       return S_OK;
     }
 
+    // blessed: present-idle -- a separate object, not this one
+    if (riid == __uuidof(IBlessedDXGIVkWindow)) {
+      *ppvObject = ref(new BlessedDxgiWindow(m_window));
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(IDXGIVkSurfaceFactory), riid)) {
       Logger::warn("DxgiSurfaceFactory::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));

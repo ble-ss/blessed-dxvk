@@ -232,10 +232,16 @@ namespace dxvk {
    * to fill in sharing mode infos for resource creation.
    */
   struct DxvkSharingModeInfo {
-    std::array<uint32_t, 2u> queueFamilies = { };
+    // blessed: async-compute -- up to three distinct families (graphics,
+    // transfer, the async compute family), deduplicated by
+    // DxvkDevice::getSharingMode. Was two, compared for equality; with
+    // BLESSED_ASYNC unset the result is identical (same families, order,
+    // count and mode).
+    std::array<uint32_t, 3u> queueFamilies = { };
+    uint32_t                 familyCount   = 1u;
 
     VkSharingMode sharingMode() const {
-      return queueFamilies[0] != queueFamilies[1]
+      return familyCount > 1u
         ? VK_SHARING_MODE_CONCURRENT
         : VK_SHARING_MODE_EXCLUSIVE;
     }
@@ -245,7 +251,7 @@ namespace dxvk {
       info.sharingMode = sharingMode();
 
       if (info.sharingMode == VK_SHARING_MODE_CONCURRENT) {
-        info.queueFamilyIndexCount = queueFamilies.size();
+        info.queueFamilyIndexCount = familyCount;
         info.pQueueFamilyIndices = queueFamilies.data();
       }
     }
@@ -537,6 +543,12 @@ namespace dxvk {
     force_inline void decRef() {
       if (unlikely(m_useCount.fetch_sub(1u) == 1u))
         free();
+    }
+
+    // blessed: cb-ring -- current reference count, so the ring can see
+    // when it holds the last reference to one of its blocks
+    uint32_t blessedUseCount() const {
+      return m_useCount.load(std::memory_order_acquire);
     }
 
     /**

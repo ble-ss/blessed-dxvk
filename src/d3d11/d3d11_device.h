@@ -25,6 +25,8 @@
 #include "d3d11_state.h"
 #include "d3d11_util.h"
 
+#include "../util/util_blessed_fe_census.h" // blessed: threaded-fe
+
 namespace dxvk {
   class DxgiAdapter;
   
@@ -39,6 +41,7 @@ namespace dxvk {
   class D3D11Texture1D;
   class D3D11Texture2D;
   class D3D11Texture3D;
+  class D3D11ThreadedContext; // blessed: threaded-fe
   
   /**
    * \brief D3D11 device implementation
@@ -467,6 +470,22 @@ namespace dxvk {
       return m_context.ptr();
     }
 
+    /**
+     * rief blessed: threaded-fe -- the recording facade, if any
+     *
+     * Non-null only with d3d11.blessedThreadedFrontEnd. GetContext stays
+     * the real context: code that touches it from the game side must
+     * call BlessedDrainFrontEnd first.
+     */
+    D3D11ThreadedContext* BlessedFrontEnd() const {
+      return m_blessedFrontEnd;
+    }
+
+    void BlessedDrainFrontEnd(blessed::FeDrain Reason) {
+      if (unlikely(m_blessedFrontEnd != nullptr))
+        BlessedDrainFrontEndSlow(Reason);
+    }
+
     bool Is11on12Device() const;
 
     bool LockImage(
@@ -517,6 +536,11 @@ namespace dxvk {
     D3D11DeviceFeatures             m_deviceFeatures;
 
     Com<D3D11ImmediateContext, false> m_context;
+
+    // blessed: threaded-fe -- see BlessedFrontEnd; holds a private ref
+    D3D11ThreadedContext*             m_blessedFrontEnd = nullptr;
+
+    void BlessedDrainFrontEndSlow(blessed::FeDrain Reason);
 
     HRESULT CreateShaderModule(
             D3D11CommonShader*      pShaderModule,

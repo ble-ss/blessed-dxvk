@@ -170,6 +170,34 @@ namespace dxvk {
       return m_bindings;
     }
 
+    // blessed: cascade-cache -- the declared size, in vec4s, of the
+    // constant buffer at each slot (dcl_constantbuffer cbN[size]); 0 when
+    // undeclared or dynamically indexed (then the whole buffer counts)
+    uint32_t BlessedCbvSize(uint32_t Slot) const {
+      return Slot < m_blessedCbvSize.size() ? m_blessedCbvSize[Slot] : 0u;
+    }
+
+    void BlessedSetCbvSizes(const std::array<uint16_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>& Sizes) {
+      m_blessedCbvSize = Sizes;
+    }
+
+    // blessed: cascade-cache -- the constant registers the shader reads:
+    // bit r of slot N is cbN[r]; a slot read with a relative index (or past
+    // c63) counts as read whole
+    uint64_t BlessedCbvRegs(uint32_t Slot) const {
+      return Slot < m_blessedCbvRegs.size() ? m_blessedCbvRegs[Slot] : 0u;
+    }
+
+    bool BlessedCbvWhole(uint32_t Slot) const {
+      return !m_blessedCbvKnown || Slot >= m_blessedCbvRegs.size() || (m_blessedCbvWhole & (1u << Slot));
+    }
+
+    void BlessedSetCbvRegs(const std::array<uint64_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>& Regs, uint32_t Whole) {
+      m_blessedCbvRegs  = Regs;
+      m_blessedCbvWhole = Whole;
+      m_blessedCbvKnown = true;
+    }
+
     D3D11InstanceData GetClassInstanceData(
             uint32_t                Slot,
             D3D11ClassInstance*     pClassInstance) const {
@@ -183,6 +211,10 @@ namespace dxvk {
 
     D3D11BindingMask    m_bindings = { };
     D3D11InterfaceInfo  m_interfaces = { };
+    std::array<uint16_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> m_blessedCbvSize = { }; // blessed: cascade-cache
+    std::array<uint64_t, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> m_blessedCbvRegs = { }; // blessed: cascade-cache
+    uint32_t m_blessedCbvWhole = 0u; // blessed: cascade-cache
+    bool     m_blessedCbvKnown = false; // blessed: cascade-cache, false: every slot counts as read whole
 
     void CreateIrShader(
             D3D11Device*            pDevice,

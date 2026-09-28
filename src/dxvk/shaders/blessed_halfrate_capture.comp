@@ -1,0 +1,66 @@
+// blessed: half-rate far field -- capture the far layer from the finished main lit pass (on frames)
+#version 460
+
+#extension GL_EXT_samplerless_texture_functions : require
+
+// blessed: one thread per pixel. Keeps colour, rt2 and rt3 of every pixel
+// whose surface is at least captureDist away, plus its depth; marks every
+// other pixel "sky" (nothing drawn) or "near". See
+// docs/research/halfrate-far.md in the main repo.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+  mat4  invViewProj;       // this frame's CameraViewProjInverse (row-major bytes, v * M)
+  mat4  viewProj;          // unused here
+  mat4  layerViewProj;     // unused here
+  mat4  layerInvViewProj;  // unused here
+  vec4  camDelta;          // unused here
+  vec4  params;            // x captureDist, y same-surface tolerance, z clear depth, w mode
+  ivec4 size;              // xy target extent
+} p;
+
+layout(set = 0, binding = 1) uniform texture2D s_depth;
+layout(set = 0, binding = 2) uniform texture2D s_rt0;
+layout(set = 0, binding = 3) uniform texture2D s_rt2;
+layout(set = 0, binding = 4) uniform texture2D s_rt3;
+
+// blessed: explicit formats -- formatless storage access is not enabled on
+// this device (see blessed_soft_shadow_filter.comp)
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D o_col;
+layout(set = 0, binding = 6, rgba8)   uniform writeonly image2D o_rt2;
+layout(set = 0, binding = 7, rgba8)   uniform writeonly image2D o_rt3;
+layout(set = 0, binding = 8, r32f)    uniform writeonly image2D o_depth;
+
+const float MARK_SKY  = 2.0;
+const float MARK_NEAR = -1.0;
+
+void main() {
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+
+  if (any(greaterThanEqual(coord, p.size.xy)))
+    return;
+
+  float depth = texelFetch(s_depth, coord, 0).r;
+
+  if (depth >= p.params.z) {
+    imageStore(o_depth, coord, vec4(MARK_SKY));
+    return;
+  }
+
+  // d3d viewport conventions: ndc.x = 2u-1, ndc.y = 1-2v
+  vec2 uv = (vec2(coord) + 0.5) / vec2(p.size.xy);
+  vec4 ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+  vec4 posH = ndc * p.invViewProj;
+  float dist = length(posH.xyz / posH.w);
+
+  if (dist < p.params.x) {
+    imageStore(o_depth, coord, vec4(MARK_NEAR));
+    return;
+  }
+
+  imageStore(o_col,   coord, texelFetch(s_rt0, coord, 0));
+  imageStore(o_rt2,   coord, texelFetch(s_rt2, coord, 0));
+  imageStore(o_rt3,   coord, vec4(texelFetch(s_rt3, coord, 0).rg, 0.0, 0.0));
+  imageStore(o_depth, coord, vec4(depth));
+}

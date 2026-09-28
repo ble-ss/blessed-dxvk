@@ -16,6 +16,15 @@ namespace dxvk {
     this->forceComputeLdsBarriers = config.getOption<bool>("d3d11.forceComputeLdsBarriers", false);
     this->forceComputeUavBarriers = config.getOption<bool>("d3d11.forceComputeUavBarriers", false);
     this->relaxedBarriers       = config.getOption<bool>("d3d11.relaxedBarriers", false);
+    this->blessedCbRing         = config.getOption<bool>("d3d11.blessedCbRing", false); // blessed: cb-ring
+    this->blessedCbRingDeviceLocal = config.getOption<bool>("d3d11.blessedCbRingDeviceLocal", false); // blessed: perf-halfrate
+    this->blessedCbMirror       = config.getOption<bool>("d3d11.blessedCbMirror", false); // blessed: cb-mirror
+    this->blessedVbRebar        = config.getOption<bool>("d3d11.blessedVbRebar", false); // blessed: traverse-passes
+    this->blessedThreadedFrontEnd = config.getOption<bool>("d3d11.blessedThreadedFrontEnd", false); // blessed: threaded-fe
+    this->blessedThreadedFrontEndLoopback = config.getOption<bool>("d3d11.blessedThreadedFrontEndLoopback", false); // blessed: threaded-fe
+    this->blessedThreadedPresent = config.getOption<bool>("d3d11.blessedThreadedPresent", true); // blessed: threaded-fe-2
+    this->blessedFrontEndCpu = config.getOption<std::string>("d3d11.blessedFrontEndCpu", std::string()); // blessed: threaded-fe-2
+    this->blessedFrontEndCompact = config.getOption<bool>("d3d11.blessedFrontEndCompact", true); // blessed: threaded-fe-2
     this->relaxedGraphicsBarriers = config.getOption<bool>("d3d11.relaxedGraphicsBarriers", false);
     this->maxTessFactor         = config.getOption<int32_t>("d3d11.maxTessFactor", 0);
     this->samplerAnisotropy     = config.getOption<int32_t>("d3d11.samplerAnisotropy", -1);

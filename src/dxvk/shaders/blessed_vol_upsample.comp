@@ -1,0 +1,155 @@
+// blessed: BLESSED_VOLUMETRICS=rt pass 2/2 -- depth-aware upsample of the low-res in-scatter into pass 138's r16f target
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+layout(set = 1, binding = 0)
+uniform texture2D s_depth;
+
+// this dispatch's accumulation (low res), see blessed_vol_trace.comp
+layout(set = 1, binding = 1)
+uniform texture2D s_accum;
+
+// pass 138's own render target. blessed: vol-2 -- read as well: before we
+// overwrite a pixel, it holds vanilla's value this frame (the stats compare)
+layout(set = 1, binding = 2, r16f)
+uniform image2D s_output;
+
+// blessed: vol-2 -- per-group sums: [2i] ours as written, [2i+1] vanilla's
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedVolStats {
+  float v[];
+};
+
+// blessed: the leading fields of BlessedVolConstants (blessed_vol_trace.comp);
+// only these are read here
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedVolConstants {
+  mat4  invViewProj;
+  mat4  prevViewProj;
+  vec3  camDelta;
+  vec3  sunDir;
+  vec3  reprojDelta;
+  float farDepthValue;
+  float phaseG;
+  float density;
+  float heightFalloff;
+  float heightBase;
+  float heightFloor;
+  float range;
+};
+
+layout(push_constant, scalar) uniform BlessedVolPush {
+  uint64_t constantsAddress;
+  uint64_t tlasAddress;
+  uint     fullWidth;
+  uint     fullHeight;
+  uint     lowWidth;
+  uint     lowHeight;
+  uint     divisor;
+  uint     samplerIndex;
+  uint     tlasValid;
+  uint     debugMode;
+  float    outScale;        // game intensity x BLESSED_VOL_GAIN (1 in debug views)
+  float    maxOut;          // blessed: vol-2, soft shoulder (upsample), 0 = off
+  uint64_t statsAddress;    // blessed: vol-2, per-group (ours, vanilla) sums or 0
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float ACCUM_TO_POS = 64.0;
+
+shared vec2 s_sums[64];
+
+// blessed: vol-2 -- the whole group reaches this (no early return before
+// it), so the barrier is uniform
+void WriteStats(vec2 local) {
+  s_sums[gl_LocalInvocationIndex] = local;
+  barrier();
+  for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    if (gl_LocalInvocationIndex < stride)
+      s_sums[gl_LocalInvocationIndex] += s_sums[gl_LocalInvocationIndex + stride];
+    barrier();
+  }
+  if (gl_LocalInvocationIndex == 0u) {
+    BlessedVolStats stats = BlessedVolStats(pc.statsAddress);
+    uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    stats.v[2u * group + 0u] = s_sums[0].x;
+    stats.v[2u * group + 1u] = s_sums[0].y;
+  }
+}
+
+float Upsample(ivec2 coord);
+
+void main() {
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  bool inside = coord.x < int(pc.fullWidth) && coord.y < int(pc.fullHeight);
+
+  // blessed: vol-2 -- clear mode (pass 138 skipped, nothing to trace)
+  if (pc.debugMode == 255u) {
+    if (inside)
+      imageStore(s_output, coord, vec4(0.0));
+    return;
+  }
+
+  vec2 local = vec2(0.0);
+  if (inside) {
+    float vanilla = pc.statsAddress != 0ul ? imageLoad(s_output, coord).r : 0.0;
+    float x = Upsample(coord) * pc.outScale;
+    // soft shoulder: linear near 0, never above maxOut
+    float outV = pc.maxOut > 0.0 ? x * pc.maxOut / (pc.maxOut + x) : x;
+    imageStore(s_output, coord, vec4(outV, 0.0, 0.0, 0.0));
+    local = vec2(outV, vanilla);
+  }
+
+  if (pc.statsAddress != 0ul)
+    WriteStats(local);
+}
+
+float Upsample(ivec2 coord) {
+  BlessedVolConstants k = BlessedVolConstants(pc.constantsAddress);
+
+  float depth = texelFetch(sampler2D(s_depth, s_samplers[pc.samplerIndex]), coord, 0).r;
+  float dist = k.range;
+  if (depth != k.farDepthValue) {
+    vec2 uv = (vec2(coord) + 0.5) / vec2(pc.fullWidth, pc.fullHeight);
+    vec4 h = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0) * k.invViewProj;
+    dist = min(length(h.xyz / h.w), k.range);
+  }
+
+  // the four low-res cells around this pixel, bilinear weights times a
+  // relative-distance similarity so shafts don't bleed across silhouettes
+  vec2 lowPos = (vec2(coord) + 0.5) / float(pc.divisor) - 0.5;
+  ivec2 base = ivec2(floor(lowPos));
+  vec2 f = lowPos - vec2(base);
+  ivec2 lowMax = ivec2(int(pc.lowWidth) - 1, int(pc.lowHeight) - 1);
+
+  float sum = 0.0;
+  float wsum = 0.0;
+  float nearestVal = 0.0;
+  float nearestErr = 1.0e30;
+
+  for (int j = 0; j < 2; j++) {
+    for (int i = 0; i < 2; i++) {
+      ivec2 c = clamp(base + ivec2(i, j), ivec2(0), lowMax);
+      vec4 a = texelFetch(sampler2D(s_accum, s_samplers[pc.samplerIndex]), c, 0);
+      float d = length(a.yzw * ACCUM_TO_POS);
+      float err = abs(d - dist) / max(dist, 1.0);
+      float bw = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+      float w = bw / (0.02 + err);
+      sum += a.x * w;
+      wsum += w;
+      if (err < nearestErr) {
+        nearestErr = err;
+        nearestVal = a.x;
+      }
+    }
+  }
+
+  float v = wsum > 1.0e-6 ? sum / wsum : nearestVal;
+  return max(v, 0.0);
+}

@@ -1,0 +1,163 @@
+// blessed: compute skinning -- blends bone matrices per vertex and writes camera-relative positions for every skinned draw of a frame in one dispatch
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// blessed: raw, word-addressable views over the game's own vertex streams --
+// dxvk vertex attribute offsets are always 4-byte aligned (D3D11InputLayout
+// enforces min(elementSize, 4) alignment), so every attribute we read starts
+// on a word boundary even though the stride between vertices may not.
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer ByteBuf {
+  uint words[];
+};
+
+// 80 bones * 3 rows of float4 (row-major float3x4 per bone), matching
+// Skinned.hlsli's BonesBuffer (b10) exactly -- see docs/research/no-b2-draws.md.
+const uint BoneRowCount = 240u;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer BonesBuf {
+  vec4 rows[BoneRowCount];
+};
+
+// tightly packed float3 per vertex, one buffer per skinned cache entry --
+// the BLAS build/refit reads it directly as its vertex buffer.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer Vec3Out {
+  float data[];
+};
+
+// blessed: skin-v2 -- one record per skinned draw of the frame. Must match
+// BlessedSkinDrawRecord in blessed_scene.cpp exactly (scalar layout, 80 bytes).
+// posBuf/idxBuf/wtBuf each already point at their attribute's own byte
+// offset within the vertex, so every read is just vtx * stride.
+// blessed: hook-cpu-2 -- bonesBuf is the draw's own b10 range in the game's
+// discard allocation (16-byte aligned, checked on the host), not a copy.
+struct SkinDraw {
+  uint64_t posBuf;
+  uint64_t idxBuf;
+  uint64_t wtBuf;
+  uint64_t outBuf;
+  uint64_t bonesBuf;
+  vec3     pivot;       // the vs's own b12:640
+  uint     posStride;
+  uint     posFormat;   // 0 = rgb32f, 1 = rgba32f (xyz used), 2 = rgba16f (xyz used)
+  uint     idxStride;
+  uint     wtStride;
+  uint     vertexCount;
+  uint     firstGroup;  // first workgroup of this draw in the dispatch
+  uint     reserved;
+};
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer DrawTable {
+  SkinDraw draws[];
+};
+
+// workgroup -> draw index, filled on the host
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer GroupMap {
+  uint drawIndex[];
+};
+
+layout(push_constant, scalar) uniform BlessedSkinPushData {
+  DrawTable table;
+  GroupMap  groups;
+  uint      groupCount;
+} pc;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+vec3 readPosition(ByteBuf buf, uint format, uint byteOffset) {
+  uint w = byteOffset >> 2u;
+
+  if (format == 2u) {
+    // R16G16B16A16_SFLOAT: word0 = (x,y) halves, word1 = (z,w) halves
+    vec2 xy = unpackHalf2x16(buf.words[w]);
+    vec2 zw = unpackHalf2x16(buf.words[w + 1u]);
+    return vec3(xy.x, xy.y, zw.x);
+  }
+
+  // R32G32B32_SFLOAT / R32G32B32A32_SFLOAT: xyz are the first three words
+  return vec3(
+    uintBitsToFloat(buf.words[w]),
+    uintBitsToFloat(buf.words[w + 1u]),
+    uintBitsToFloat(buf.words[w + 2u]));
+}
+
+// BLENDINDICES0, always R8G8B8A8_UNORM -- the raw ubyte is the bone index,
+// its first row is ubyte * 3. blessed: skin-v2 -- clamped to the last bone:
+// a ubyte above 79 used to read past the 3,840-byte snapshot (and past the
+// end of the frame's bones buffer for the last draw).
+uvec4 readBoneRows(ByteBuf buf, uint byteOffset) {
+  uint word = buf.words[byteOffset >> 2u];
+  uvec4 ubyte4 = uvec4(
+    word         & 0xFFu,
+    (word >> 8u)  & 0xFFu,
+    (word >> 16u) & 0xFFu,
+    (word >> 24u) & 0xFFu);
+  return min(ubyte4 * 3u, uvec4(BoneRowCount - 3u));
+}
+
+// BLENDWEIGHT0, always R16G16B16A16_SFLOAT
+vec4 readWeights(ByteBuf buf, uint byteOffset) {
+  uint w = byteOffset >> 2u;
+  vec2 xy = unpackHalf2x16(buf.words[w]);
+  vec2 zw = unpackHalf2x16(buf.words[w + 1u]);
+  return vec4(xy, zw);
+}
+
+void main() {
+  uint group = gl_WorkGroupID.x;
+  if (group >= pc.groupCount)
+    return;
+
+  SkinDraw d = pc.table.draws[pc.groups.drawIndex[group]];
+
+  uint vtx = (group - d.firstGroup) * 64u + gl_LocalInvocationID.x;
+  if (vtx >= d.vertexCount)
+    return;
+
+  BonesBuf bones = BonesBuf(d.bonesBuf);
+
+  vec3  positionMS = readPosition(ByteBuf(d.posBuf), d.posFormat, vtx * d.posStride);
+  uvec4 rowIndex   = readBoneRows(ByteBuf(d.idxBuf), vtx * d.idxStride);
+  vec4  weight     = readWeights(ByteBuf(d.wtBuf), vtx * d.wtStride);
+
+  // blend up to four bone matrices (3 rows each) by vertex weight; a zero
+  // weight's bone is not read at all (its index may be garbage)
+  vec4 m0 = vec4(0.0), m1 = vec4(0.0), m2 = vec4(0.0);
+  for (uint k = 0u; k < 4u; k++) {
+    float w = weight[k];
+    if (w == 0.0)
+      continue;
+
+    uint r = rowIndex[k];
+    m0 += w * bones.rows[r];
+    m1 += w * bones.rows[r + 1u];
+    m2 += w * bones.rows[r + 2u];
+  }
+
+  // subtract the pivot from the translation column only -- see
+  // Skinned::GetBoneTransformMatrix in the research doc: this is exactly
+  // equivalent to subtracting it from each bone's translation before the
+  // blend above, since the four weights sum to ~1.
+  m0.w -= d.pivot.x;
+  m1.w -= d.pivot.y;
+  m2.w -= d.pivot.z;
+
+  vec3 outPos = vec3(
+    dot(m0.xyz, positionMS) + m0.w,
+    dot(m1.xyz, positionMS) + m1.w,
+    dot(m2.xyz, positionMS) + m2.w);
+
+  // blessed: skin-v2 -- a NaN x makes a triangle inactive, and a refit must
+  // not change which primitives are active (vulkan spec, "inactive
+  // primitives"); always write finite positions so it never does.
+  if (any(isnan(outPos)) || any(isinf(outPos)))
+    outPos = vec3(0.0);
+
+  Vec3Out outBuf = Vec3Out(d.outBuf);
+  uint o = vtx * 3u;
+  outBuf.data[o]      = outPos.x;
+  outBuf.data[o + 1u] = outPos.y;
+  outBuf.data[o + 2u] = outPos.z;
+}

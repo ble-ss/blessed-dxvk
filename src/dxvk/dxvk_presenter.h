@@ -25,6 +25,7 @@ namespace dxvk {
   using PresenterSurfaceProc = std::function<VkResult (VkSurfaceKHR*)>;
 
   class DxvkDevice;
+  class BlessedPresentBridge; // blessed: present-idle
 
   /**
    * \brief Presenter description
@@ -50,6 +51,9 @@ namespace dxvk {
     VkSemaphore present = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkBool32 fenceSignaled = VK_FALSE;
+    // blessed: present-idle -- nonzero: 'present' is a timeline semaphore
+    // (BLESSED_PRESENT=bridge) and the blit's command list signals this value
+    uint64_t blessedPresentValue = 0u;
   };
 
   /**
@@ -148,6 +152,25 @@ namespace dxvk {
     void signalFrame(
             uint64_t                frameId,
       const Rc<DxvkLatencyTracker>& tracker);
+
+    /**
+     * \brief blessed: present-idle -- presents through a d3d12 swap chain
+     *
+     * BLESSED_PRESENT=bridge. Call once after creation, before the first
+     * acquire. Keeps the vulkan path if the bridge cannot be set up.
+     * \param [in] window The window the app's swap chain belongs to
+     */
+    void blessedUseBridge(HWND window);
+
+    /**
+     * \brief blessed: present-fse-appcontrolled -- requests app-controlled FSE
+     *
+     * BLESSED_FSE=app. Call once after creation, before the first swap chain
+     * is created, with the window the app already sized to the monitor.
+     * Ignored if the device does not expose VK_EXT_full_screen_exclusive.
+     * \param [in] window The fullscreen-sized window to request exclusive mode on
+     */
+    void blessedRequestAppControlledFse(HWND window);
 
     /**
      * \brief Changes sync interval
@@ -332,6 +355,12 @@ namespace dxvk {
 
     bool                        m_hasGamescopeFenceSignalBug = false;
 
+    Rc<BlessedPresentBridge> m_blessedBridge; // blessed: present-idle
+
+    // blessed: present-fse-appcontrolled -- BLESSED_FSE=app state
+    HWND                     m_blessedFseWindow   = nullptr;
+    bool                     m_blessedFseAcquired = false;
+
     static const std::array<std::pair<VkColorSpaceKHR, VkColorSpaceKHR>, 2> s_colorSpaceFallbacks;
 
     void updateSwapChain();
@@ -395,6 +424,17 @@ namespace dxvk {
 
     static VkResult softError(
             VkResult                  vr);
+
+    // blessed: present-fse-appcontrolled
+    bool blessedFseRequested() const;
+
+    VkSurfaceFullScreenExclusiveWin32InfoEXT blessedFseWin32Info() const;
+
+    void blessedAcquireFse();
+
+    void blessedReleaseFse();
+
+    void blessedSyncFseFocus();
 
   };
 

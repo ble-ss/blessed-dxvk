@@ -350,6 +350,20 @@ namespace dxvk {
     }
 
     /**
+     * \brief blessed: vrs -- pixel shader must shade at 1x1
+     *
+     * Set once by d3d11 at shader creation, and only when BLESSED_VRS is
+     * on: the shader discards, or writes depth, coverage or stencil ref.
+     */
+    bool blessedVrsFullRate() const {
+      return m_blessedVrsFullRate;
+    }
+
+    void blessedSetVrsFullRate(bool fullRate) {
+      m_blessedVrsFullRate = fullRate;
+    }
+
+    /**
      * \brief Queries shader dump path
      * \returns Shader dump path, or empty string
      */
@@ -363,6 +377,8 @@ namespace dxvk {
     uint32_t                      m_cookie = 0;
 
     std::atomic<bool>             m_needsCompile = { true };
+
+    bool                          m_blessedVrsFullRate = false; // blessed: vrs
 
     std::optional<DxvkShaderMetadata> m_metadata;
 

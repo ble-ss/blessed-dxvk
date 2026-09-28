@@ -375,6 +375,12 @@ namespace dxvk {
     if (m_device->features().extExtendedDynamicState3.extendedDynamicState3DepthClipEnable)
       dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT);
 
+    // blessed: vrs -- rate state is in both pre-raster and fragment subsets
+    bool blessedVrs = m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate;
+
+    if (blessedVrs)
+      dynamicStates.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
+
     VkPipelineDynamicStateCreateInfo dyInfo = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     dyInfo.dynamicStateCount  = dynamicStates.size();
     dyInfo.pDynamicStates     = dynamicStates.data();
@@ -417,6 +423,9 @@ namespace dxvk {
 
     if (m_device->canUseDescriptorBuffer())
       flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
+
+    if (blessedVrs) // blessed: vrs
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
     VkGraphicsPipelineLibraryCreateInfoEXT libInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &flagsInfo };
     libInfo.flags             = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
@@ -487,6 +496,12 @@ namespace dxvk {
       dynamicStates.push_back(VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT);
     }
 
+    // blessed: vrs -- must match the pre-raster library, see above
+    bool blessedVrs = m_device->features().khrFragmentShadingRate.attachmentFragmentShadingRate;
+
+    if (blessedVrs)
+      dynamicStates.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
+
     VkPipelineDynamicStateCreateInfo dyInfo = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     dyInfo.dynamicStateCount  = dynamicStates.size();
     dyInfo.pDynamicStates     = dynamicStates.data();
@@ -520,6 +535,9 @@ namespace dxvk {
 
     if (m_device->canUseDescriptorBuffer())
       flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
+
+    if (blessedVrs) // blessed: vrs
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
     VkGraphicsPipelineLibraryCreateInfoEXT libInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &flagsInfo };
     libInfo.flags             = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;

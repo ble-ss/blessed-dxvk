@@ -1,0 +1,181 @@
+// blessed: BLESSED_POINT_SOFT pass 1/2 -- sphere-light cone rays toward one point light + temporal accumulation into its channel
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+layout(set = 1, binding = 0)
+uniform texture2D s_depth;
+
+// blessed: last frame's accumulated visibility, one mask channel per
+// component, and last frame's surfaces (xyz = camera-relative position / 64,
+// all-zero = sky). Sampled bilinearly at the reprojected uv, as the sun does.
+layout(set = 1, binding = 1)
+uniform texture2D s_visHistory;
+
+layout(set = 1, binding = 2)
+uniform texture2D s_posHistory;
+
+// blessed: this frame's pair, becoming next frame's history. visOut is
+// read-modify-written: each light owns one component.
+layout(set = 1, binding = 3, rgba16f)
+uniform image2D s_visOut;
+
+layout(set = 1, binding = 4, rgba16f)
+uniform image2D s_posOut;
+
+// blessed: byte-for-byte BlessedPointSoftConstants in blessed_point_shadow.cpp
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedPointSoftConstants {
+  mat4  invViewProj;     // CameraViewProjInverse, row-major as stored
+  mat4  prevViewProj;    // inverse of the history frame's CameraViewProjInverse
+  vec3  camDelta;        // tlas-frame shift
+  vec3  lightPos;        // camera-relative light origin
+  vec3  reprojDelta;     // this frame's camera - the history frame's camera
+  float radius;          // cull radius, 0 = none
+  float proxyRadius;
+  float lightRadius;     // the sphere light's radius (BLESSED_POINT_LIGHT_RADIUS)
+  float farDepthValue;
+  uint  spp;
+  uint  frameIndex;
+  uint  channel;         // 0..3, this light's component
+  uint  historyValid;    // 0 = reject every pixel this dispatch
+  uint  width;
+  uint  height;
+  uint  tlasValid;
+  uint  debugMode;       // 7 = hist (1 rejected, 0 kept)
+};
+
+layout(push_constant, scalar) uniform BlessedPointSoftPush {
+  uint64_t constantsAddress;
+  uint64_t tlasAddress;
+  uint64_t debugAddress;   // filter pass only
+  uint     samplerIndex;
+  uint     channelMask;    // filter pass only
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const float POS_TO_ACCUM = 1.0 / 64.0;
+const float ACCUM_TO_POS = 64.0;
+const float REJECT_REL   = 0.01;
+
+float Hash(uvec2 p, uint salt) {
+  uint h = p.x * 374761393u + p.y * 668265263u + salt * 2654435761u;
+  h = (h ^ (h >> 13u)) * 1274126177u;
+  h ^= h >> 16u;
+  return float(h) * (1.0 / 4294967296.0);
+}
+
+vec3 SampleCone(vec3 dir, float cosThetaMax, vec2 xi) {
+  float cosTheta = mix(cosThetaMax, 1.0, xi.x);
+  float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+  float phi = 6.28318530718 * xi.y;
+
+  vec3 up = abs(dir.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+  vec3 tangent   = normalize(cross(up, dir));
+  vec3 bitangent = cross(dir, tangent);
+
+  return normalize(tangent * (cos(phi) * sinTheta) + bitangent * (sin(phi) * sinTheta) + dir * cosTheta);
+}
+
+void storeVis(ivec2 coord, uint channel, float v) {
+  vec4 prev = imageLoad(s_visOut, coord);
+  prev[channel] = v;
+  imageStore(s_visOut, coord, prev);
+}
+
+void main() {
+  BlessedPointSoftConstants k = BlessedPointSoftConstants(pc.constantsAddress);
+
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(k.width) || coord.y >= int(k.height))
+    return;
+
+  float depth = texelFetch(sampler2D(s_depth, s_samplers[pc.samplerIndex]), coord, 0).r;
+
+  if (depth == k.farDepthValue) {
+    imageStore(s_posOut, coord, vec4(0.0));
+    storeVis(coord, k.channel, 1.0);
+    return;
+  }
+
+  vec2 uv = (vec2(coord) + 0.5) / vec2(k.width, k.height);
+  vec4 ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+  vec4 viewPosH = ndc * k.invViewProj;
+  vec3 camRelPos = viewPosH.xyz / viewPosH.w;
+
+  imageStore(s_posOut, coord, vec4(camRelPos * POS_TO_ACCUM, 0.0));
+
+  vec3 toLight = k.lightPos - camRelPos;
+  float lightDist = length(toLight);
+
+  if ((k.radius > 0.0 && lightDist > k.radius) || k.tlasValid == 0u) {
+    storeVis(coord, k.channel, 1.0);
+    return;
+  }
+
+  float camDist = length(camRelPos);
+  float tMin = 0.01 * camDist + 1.0;
+  float tMax = lightDist - k.proxyRadius;
+
+  float visRaw = 1.0;
+  if (tMax > tMin) {
+    vec3 dir = toLight / lightDist;
+    float sinThetaMax = min(k.lightRadius / max(lightDist, 1.0e-3), 1.0);
+    float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMax * sinThetaMax));
+    uint spp = max(k.spp, 1u);
+
+    uint lit = 0u;
+    for (uint i = 0u; i < spp; i++) {
+      vec2 xi = vec2(
+        Hash(uvec2(coord), k.frameIndex * 8u + i * 2u + k.channel * 64u),
+        Hash(uvec2(coord) + uvec2(17u, 53u), k.frameIndex * 8u + i * 2u + 1u + k.channel * 64u));
+      vec3 rayDir = SampleCone(dir, cosThetaMax, xi);
+
+      rayQueryEXT rq;
+      rayQueryInitializeEXT(rq, accelerationStructureEXT(pc.tlasAddress),
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+        camRelPos + k.camDelta, tMin, rayDir, tMax);
+      while (rayQueryProceedEXT(rq)) { }
+
+      if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+        lit++;
+    }
+
+    visRaw = float(lit) / float(spp);
+  }
+
+  // blessed: the sun's reprojection (shadow-slide): this frame's surface,
+  // shifted into the history camera's frame and projected with its matrix
+  vec3 posPrev = camRelPos + k.reprojDelta;
+  float distPrev = length(posPrev);
+
+  vec4 clipPrev = vec4(posPrev, 1.0) * k.prevViewProj;
+  bool offscreen = clipPrev.w <= 0.0;
+
+  vec2 uvPrev = vec2(0.5);
+  if (!offscreen) {
+    vec3 ndcPrev = clipPrev.xyz / clipPrev.w;
+    uvPrev = vec2(ndcPrev.x * 0.5 + 0.5, (1.0 - ndcPrev.y) * 0.5);
+    offscreen = any(lessThan(uvPrev, vec2(0.0))) || any(greaterThan(uvPrev, vec2(1.0)));
+  }
+
+  vec3 histPos = texture(sampler2D(s_posHistory, s_samplers[pc.samplerIndex]), uvPrev).xyz * ACCUM_TO_POS;
+  float histVis = texture(sampler2D(s_visHistory, s_samplers[pc.samplerIndex]), uvPrev)[k.channel];
+
+  bool noHistory = offscreen || k.historyValid == 0u || dot(histPos, histPos) == 0.0;
+  bool reject = noHistory || length(histPos - posPrev) > REJECT_REL * max(distPrev, 1.0);
+
+  if (k.debugMode == 7u) {
+    storeVis(coord, k.channel, reject ? 1.0 : 0.0);
+    return;
+  }
+
+  storeVis(coord, k.channel, reject ? visRaw : mix(histVis, visRaw, 0.1));
+}

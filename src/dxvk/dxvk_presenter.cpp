@@ -5,7 +5,19 @@
 
 #include "../wsi/wsi_window.h"
 
+#include "blessed/blessed_present.h" // blessed: present-idle
+#include "blessed/blessed_present_bridge.h" // blessed: present-idle
+#include "blessed/blessed_fse.h" // blessed: present-fse-appcontrolled
+#include "../util/util_env.h" // blessed: zero-copy-present
+
 namespace dxvk {
+
+  // blessed: zero-copy-present, see d3d11/blessed_zero_copy.h
+  static bool blessedZeroCopyWanted() {
+    static const bool s_wanted = env::getEnvVar("BLESSED_ZERO_COPY") == "1";
+    return s_wanted;
+  }
+
 
   const std::array<std::pair<VkColorSpaceKHR, VkColorSpaceKHR>, 2> Presenter::s_colorSpaceFallbacks = {{
     { VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT, VK_COLOR_SPACE_HDR10_ST2084_EXT },
@@ -52,6 +64,7 @@ namespace dxvk {
 
   
   Presenter::~Presenter() {
+    m_blessedBridge = nullptr; // blessed: present-idle
     destroySwapchain();
     destroySurface();
     destroyLatencySemaphore();
@@ -70,6 +83,9 @@ namespace dxvk {
 
   VkResult Presenter::checkSwapChainStatus() {
     std::lock_guard lock(m_surfaceMutex);
+
+    if (unlikely(m_blessedBridge != nullptr)) // blessed: present-idle, no vulkan swap chain
+      return VK_SUCCESS;
 
     if (!m_swapchain)
       return recreateSwapChain();
@@ -92,10 +108,29 @@ namespace dxvk {
     if (status < 0)
       return status;
 
+    // blessed: present-idle -- BLESSED_PRESENT=bridge: our d3d12 swap chain
+    if (unlikely(m_blessedBridge != nullptr)) {
+      status = m_blessedBridge->acquire(m_preferredExtent, m_preferredFormat, sync, image);
+
+      if (status == VK_SUCCESS) {
+        m_presentPending = true;
+        return status;
+      }
+
+      // never present from buffers we could not share: drop the bridge
+      // (its dxgi swap chain leaves the window) and use vulkan from here on
+      Logger::err("blessed: bridge: failed, falling back to the vulkan swap chain");
+      m_blessedBridge = nullptr;
+      status = VK_SUCCESS;
+    }
+
     // Ensure that the swap chain gets recreated if it is dirty
     bool hasSwapchain = m_swapchain != VK_NULL_HANDLE;
 
     updateSwapChain();
+
+    // blessed: present-fse-appcontrolled -- give up / reclaim exclusive mode as focus changes
+    blessedSyncFseFocus();
 
     // Don't acquire if we already did so after present
     if (m_acquireStatus == VK_NOT_READY && m_swapchain) {
@@ -176,6 +211,16 @@ namespace dxvk {
     const Rc<DxvkLatencyTracker>& tracker,
           uint32_t                rectCount,
     const VkRectLayerKHR*         rects) {
+    // blessed: present-idle -- BLESSED_PRESENT=bridge presents on the d3d12 queue
+    if (unlikely(m_blessedBridge != nullptr)) {
+      VkResult status = m_blessedBridge->present(m_preferredSyncInterval);
+
+      std::lock_guard lock(m_surfaceMutex);
+      m_presentPending = false;
+      m_surfaceCond.notify_one();
+      return status;
+    }
+
     PresenterSync& currSync = m_semaphores.at(m_frameIndex);
 
     VkPresentIdKHR presentId = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
@@ -224,8 +269,14 @@ namespace dxvk {
     if (m_hasIncrementalPresent && !m_presentRepaint && m_acquireStatus == VK_SUCCESS && rectCount)
       regionInfo.pNext = const_cast<void*>(std::exchange(info.pNext, &regionInfo));
 
-    VkResult status = m_vkd->vkQueuePresentKHR(
-      m_device->queues().graphics.queueHandle, &info);
+    // blessed: present-idle -- BLESSED_PRESENT=queue presents from a spare
+    // graphics-family queue, so the present's stall stays off the graphics queue
+    VkQueue presentQueue = m_device->queues().blessedPresent.queueHandle;
+
+    if (likely(!presentQueue))
+      presentQueue = m_device->queues().graphics.queueHandle;
+
+    VkResult status = m_vkd->vkQueuePresentKHR(presentQueue, &info);
 
     // Maintain valid state if presentation succeeded, even if we want to
     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
@@ -262,7 +313,8 @@ namespace dxvk {
 
     // On a successful present, try to acquire next image already, in
     // order to hide potential delays from the application thread.
-    if (status == VK_SUCCESS) {
+    // blessed: present-idle -- BLESSED_PRESENT_ACQUIRE=lazy leaves it to acquireNextImage
+    if (status == VK_SUCCESS && likely(!BlessedPresent::LazyAcquire())) {
       PresenterSync& nextSync = m_semaphores.at(m_frameIndex);
       waitForSwapchainFence(nextSync);
 
@@ -286,6 +338,92 @@ namespace dxvk {
 
     m_surfaceCond.notify_one();
     return status;
+  }
+
+
+  void Presenter::blessedUseBridge(HWND window) {
+    Rc<BlessedPresentBridge> bridge = new BlessedPresentBridge(m_device.ptr(), window);
+
+    if (!bridge->valid()) {
+      Logger::warn("blessed: bridge: setup failed, presenting through vulkan");
+      return;
+    }
+
+    std::lock_guard lock(m_surfaceMutex);
+    m_blessedBridge = std::move(bridge);
+  }
+
+
+  // blessed: present-fse-appcontrolled -- request VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
+  void Presenter::blessedRequestAppControlledFse(HWND window) {
+    if (BlessedFse::Mode() != BlessedFseMode::App)
+      return;
+
+    if (!m_device->features().extFullScreenExclusive) {
+      Logger::warn("blessed: fse: VK_EXT_full_screen_exclusive not supported, BLESSED_FSE=app ignored");
+      return;
+    }
+
+    m_blessedFseWindow = window;
+    m_fullscreenMode = VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT;
+
+    Logger::info("blessed: fse: application-controlled exclusive fullscreen requested");
+  }
+
+
+  bool Presenter::blessedFseRequested() const {
+    return m_fullscreenMode == VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
+        && m_blessedFseWindow != nullptr;
+  }
+
+
+  VkSurfaceFullScreenExclusiveWin32InfoEXT Presenter::blessedFseWin32Info() const {
+    VkSurfaceFullScreenExclusiveWin32InfoEXT info = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT };
+    info.hmonitor = wsi::getWindowMonitor(m_blessedFseWindow);
+    return info;
+  }
+
+
+  void Presenter::blessedAcquireFse() {
+    VkResult vr = m_vkd->vkAcquireFullScreenExclusiveModeEXT(m_vkd->device(), m_swapchain);
+
+    if (vr == VK_SUCCESS) {
+      m_blessedFseAcquired = true;
+      Logger::info("blessed: fse: acquired application-controlled exclusive fullscreen");
+    } else {
+      Logger::warn(str::format("blessed: fse: vkAcquireFullScreenExclusiveModeEXT failed: ", vr));
+    }
+  }
+
+
+  void Presenter::blessedReleaseFse() {
+    if (!m_blessedFseAcquired)
+      return;
+
+    if (m_swapchain)
+      m_vkd->vkReleaseFullScreenExclusiveModeEXT(m_vkd->device(), m_swapchain);
+
+    m_blessedFseAcquired = false;
+    Logger::info("blessed: fse: released exclusive fullscreen");
+  }
+
+
+  // blessed: present-fse-appcontrolled -- re-synced every acquire: alt-tab or
+  // another window coming to the foreground must give exclusive mode back up
+  // (VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT is also handled, generically,
+  // by the existing dirty-swapchain recreate path in acquireNextImage/presentImage)
+  void Presenter::blessedSyncFseFocus() {
+    if (!blessedFseRequested() || !m_swapchain)
+      return;
+
+    bool hasFocus = !wsi::isOccluded(m_blessedFseWindow);
+
+    if (hasFocus && !m_blessedFseAcquired)
+      blessedAcquireFse();
+    else if (!hasFocus && m_blessedFseAcquired) {
+      Logger::info("blessed: fse: window lost focus, releasing exclusive fullscreen");
+      blessedReleaseFse();
+    }
   }
 
 
@@ -357,6 +495,12 @@ namespace dxvk {
       VkResult status = m_device->getDeviceStatus();
       return !m_presentPending || status < 0;
     });
+
+    // blessed: present-idle -- the bridge's buffers go before the device does
+    if (unlikely(m_blessedBridge != nullptr)) {
+      m_blessedBridge->waitIdle();
+      m_blessedBridge = nullptr;
+    }
 
     destroySwapchain();
     destroySurface();
@@ -577,11 +721,20 @@ namespace dxvk {
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenExclusiveInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenExclusiveInfo.fullScreenExclusive = m_fullscreenMode;
 
+    // blessed: present-fse-appcontrolled -- carries the monitor for APPLICATION_CONTROLLED_EXT
+    VkSurfaceFullScreenExclusiveWin32InfoEXT fullScreenExclusiveWin32Info = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT };
+
     VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR };
     surfaceInfo.surface = m_surface;
 
-    if (m_device->features().extFullScreenExclusive)
+    if (m_device->features().extFullScreenExclusive) {
       surfaceInfo.pNext = &fullScreenExclusiveInfo;
+
+      if (blessedFseRequested()) { // blessed: present-fse-appcontrolled
+        fullScreenExclusiveWin32Info = blessedFseWin32Info();
+        fullScreenExclusiveInfo.pNext = &fullScreenExclusiveWin32Info;
+      }
+    }
 
     // Query surface capabilities. Some properties might have changed,
     // including the size limits and supported present modes, so we'll
@@ -749,6 +902,12 @@ namespace dxvk {
     swapInfo.imageArrayLayers       = 1;
     swapInfo.imageUsage             = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                                     | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    // blessed: zero-copy-present -- BLESSED_ZERO_COPY=1 renders into the
+    // swap image and, on a mid-frame fallback, copies it back out
+    if (unlikely(blessedZeroCopyWanted())
+     && (caps.surfaceCapabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+      swapInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     swapInfo.imageSharingMode       = VK_SHARING_MODE_EXCLUSIVE;
     swapInfo.preTransform           = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     swapInfo.compositeAlpha         = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -766,8 +925,17 @@ namespace dxvk {
     if (presentWait2Caps.presentWait2Supported)
       swapInfo.flags |= VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
 
-    if (m_device->features().extFullScreenExclusive)
+    // blessed: present-fse-appcontrolled -- carries the monitor for APPLICATION_CONTROLLED_EXT
+    VkSurfaceFullScreenExclusiveWin32InfoEXT fullScreenWin32Info = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT };
+
+    if (m_device->features().extFullScreenExclusive) {
       fullScreenInfo.pNext = const_cast<void*>(std::exchange(swapInfo.pNext, &fullScreenInfo));
+
+      if (blessedFseRequested()) { // blessed: present-fse-appcontrolled
+        fullScreenWin32Info = blessedFseWin32Info();
+        fullScreenWin32Info.pNext = const_cast<void*>(std::exchange(fullScreenInfo.pNext, &fullScreenWin32Info));
+      }
+    }
 
     if (m_hasSwapchainMaintenance1)
       modeInfo.pNext = std::exchange(swapInfo.pNext, &modeInfo);
@@ -810,6 +978,21 @@ namespace dxvk {
       imageInfo.colorSpace  = swapInfo.imageColorSpace;
       imageInfo.shared      = VK_TRUE;
       imageInfo.debugName   = debugName.c_str();
+
+      // blessed: zero-copy-present -- the redirect can render into a swap
+      // image across several command lists in one frame. With no stages,
+      // each list's transition out of PRESENT_SRC has an empty first scope
+      // and is not ordered after the previous list's writes (or its
+      // acquire wait); declare the stages the redirect and its fallback
+      // copy use so the transitions chain.
+      if (unlikely(blessedZeroCopyWanted())) {
+        imageInfo.stages    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                            | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        imageInfo.access    = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                            | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                            | VK_ACCESS_TRANSFER_READ_BIT
+                            | VK_ACCESS_TRANSFER_WRITE_BIT;
+      }
 
       // If possible, expose the image with an sRGB format internally so
       // that it will be used as the default format for composition.
@@ -883,6 +1066,10 @@ namespace dxvk {
     if (m_signal && m_hasPresentWait && !m_frameThread.joinable())
       m_frameThread = dxvk::thread([this] { runFrameThread(); });
 
+    // blessed: present-fse-appcontrolled -- acquire once the swap chain exists
+    if (blessedFseRequested())
+      blessedAcquireFse();
+
     m_presentRepaint = true;
     return VK_SUCCESS;
   }
@@ -894,11 +1081,19 @@ namespace dxvk {
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenInfo.fullScreenExclusive = m_fullscreenMode;
 
+    // blessed: present-fse-appcontrolled -- carries the monitor for APPLICATION_CONTROLLED_EXT
+    VkSurfaceFullScreenExclusiveWin32InfoEXT fullScreenWin32Info = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT };
+
+    if (blessedFseRequested()) {
+      fullScreenWin32Info = blessedFseWin32Info();
+      fullScreenInfo.pNext = &fullScreenWin32Info;
+    }
+
     VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &fullScreenInfo };
     surfaceInfo.surface = m_surface;
 
     VkResult status;
-    
+
     if (m_device->features().extFullScreenExclusive) {
       status = m_vki->vkGetPhysicalDeviceSurfaceFormats2KHR(
         m_device->adapter()->handle(), &surfaceInfo, &numFormats, nullptr);
@@ -940,6 +1135,14 @@ namespace dxvk {
 
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenInfo.fullScreenExclusive = m_fullscreenMode;
+
+    // blessed: present-fse-appcontrolled -- carries the monitor for APPLICATION_CONTROLLED_EXT
+    VkSurfaceFullScreenExclusiveWin32InfoEXT fullScreenWin32Info = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT };
+
+    if (blessedFseRequested()) {
+      fullScreenWin32Info = blessedFseWin32Info();
+      fullScreenInfo.pNext = &fullScreenWin32Info;
+    }
 
     VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR, &fullScreenInfo };
     surfaceInfo.surface = m_surface;
@@ -1242,6 +1445,9 @@ namespace dxvk {
       m_vkd->vkDestroySemaphore(m_vkd->device(), sem.present, nullptr);
       m_vkd->vkDestroyFence(m_vkd->device(), sem.fence, nullptr);
     }
+
+    // blessed: present-fse-appcontrolled -- release before the swapchain goes away
+    blessedReleaseFse();
 
     // The conditional is here because some third party layers don't properly handle null swapchains
     if (m_swapchain)

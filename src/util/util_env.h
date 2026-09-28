@@ -74,6 +74,21 @@ namespace dxvk::env {
   void setThreadName(const std::string& name);
 
   /**
+   * rief blessed: crash-log -- remembers a thread's name by id
+   *
+   * A fixed table (64 entries, first come), filled by setThreadName and
+   * read by the crash handler, which must not allocate.
+   * \param [in] tid Thread id
+   * \param [in] name Name, cut to 23 characters
+   */
+  void blessedRecordThreadName(uint32_t tid, const char* name);
+
+  /**
+   * rief blessed: crash-log -- a thread's recorded name, or nullptr
+   */
+  const char* blessedThreadName(uint32_t tid);
+
+  /**
    * \brief Creates a directory
    * 
    * \param [in] path Path to directory

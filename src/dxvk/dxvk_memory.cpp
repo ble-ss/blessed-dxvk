@@ -2066,6 +2066,14 @@ namespace dxvk {
             |  VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     }
 
+    // blessed: fold the acceleration-structure build input bit into the global
+    // buffer usage mask so vertex/index buffers (which now request it) keep
+    // suballocating from shared chunks instead of falling back to one
+    // dedicated VkBuffer per resource (see createInfo.usage check below).
+    if (m_device->supportsRayQuery()) {
+      flags |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    }
+
     // Check which individual flags are supported on each memory type. This is a
     // bit dodgy since the spec technically does not require a combination of flags
     // to be supported, but we need to be robust around buffer creation anyway.

@@ -26,6 +26,8 @@ namespace dxvk {
     VkPhysicalDeviceVulkan11Properties                        vk11                            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES };
     VkPhysicalDeviceVulkan12Properties                        vk12                            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES };
     VkPhysicalDeviceVulkan13Properties                        vk13                            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES };
+    // blessed: acceleration structure scratch alignment, needed by the blas builder
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR        khrAccelerationStructure        = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR };
     VkPhysicalDeviceConservativeRasterizationPropertiesEXT    extConservativeRasterization    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT };
     VkPhysicalDeviceCustomBorderColorPropertiesEXT            extCustomBorderColor            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT };
     VkPhysicalDeviceDescriptorBufferPropertiesEXT             extDescriptorBuffer             = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT };
@@ -39,6 +41,8 @@ namespace dxvk {
     VkPhysicalDeviceTransformFeedbackPropertiesEXT            extTransformFeedback            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT };
     VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT       extVertexAttributeDivisor       = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT };
     VkPhysicalDeviceFaultPropertiesKHR                        khrDeviceFault                  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_PROPERTIES_KHR };
+    // blessed: vrs -- rate attachment texel size range
+    VkPhysicalDeviceFragmentShadingRatePropertiesKHR          khrFragmentShadingRate          = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR };
     VkPhysicalDeviceMaintenance5PropertiesKHR                 khrMaintenance5                 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR };
     VkPhysicalDeviceMaintenance6PropertiesKHR                 khrMaintenance6                 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES_KHR };
     VkPhysicalDeviceMaintenance7PropertiesKHR                 khrMaintenance7                 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_PROPERTIES_KHR };
@@ -59,6 +63,11 @@ namespace dxvk {
     VkPhysicalDeviceVulkan11Features                          vk11                            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
     VkPhysicalDeviceVulkan12Features                          vk12                            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };;
     VkPhysicalDeviceVulkan13Features                          vk13                            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };;
+    // blessed: ray query / acceleration structure build support
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR          khrAccelerationStructure        = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+    VkPhysicalDeviceRayQueryFeaturesKHR                       khrRayQuery                     = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+    // deferred host operations has no feature struct; tracked as presence only
+    VkBool32                                                  khrDeferredHostOperations       = VK_FALSE;
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT   extAttachmentFeedbackLoopLayout = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT };
     VkPhysicalDeviceBorderColorSwizzleFeaturesEXT             extBorderColorSwizzle           = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT };
     VkBool32                                                  extConservativeRasterization    = VK_FALSE;
@@ -88,6 +97,8 @@ namespace dxvk {
     VkPhysicalDeviceTransformFeedbackFeaturesEXT              extTransformFeedback            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT };
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT         extVertexAttributeDivisor       = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES };
     VkPhysicalDeviceFaultFeaturesKHR                          khrDeviceFault                  = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_KHR };
+    // blessed: vrs -- BLESSED_VRS only, see blessed/blessed_vrs.h
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR            khrFragmentShadingRate          = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR };
     VkPhysicalDeviceDynamicRenderingLocalReadFeatures         khrDynamicRenderingLocalRead    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR };
     VkBool32                                                  khrExternalMemoryWin32          = VK_FALSE;
     VkBool32                                                  khrExternalSemaphoreWin32       = VK_FALSE;
@@ -135,6 +146,10 @@ namespace dxvk {
    * \brief Vulkan extension info
    */
   struct DxvkDeviceExtensionInfo {
+    // blessed: ray query / acceleration structure build support
+    VkExtensionProperties khrAccelerationStructure           = vk::makeExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    VkExtensionProperties khrRayQuery                        = vk::makeExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    VkExtensionProperties khrDeferredHostOperations          = vk::makeExtension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     VkExtensionProperties extAttachmentFeedbackLoopLayout   = vk::makeExtension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     VkExtensionProperties extBorderColorSwizzle             = vk::makeExtension(VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME);
     VkExtensionProperties extConservativeRasterization      = vk::makeExtension(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
@@ -164,6 +179,7 @@ namespace dxvk {
     VkExtensionProperties extTransformFeedback              = vk::makeExtension(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     VkExtensionProperties extVertexAttributeDivisor         = vk::makeExtension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     VkExtensionProperties khrDeviceFault                    = vk::makeExtension(VK_KHR_DEVICE_FAULT_EXTENSION_NAME);
+    VkExtensionProperties khrFragmentShadingRate            = vk::makeExtension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME); // blessed: vrs
     VkExtensionProperties khrDynamicRenderingLocalRead      = vk::makeExtension(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
     VkExtensionProperties khrExternalMemoryWin32            = vk::makeExtension(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
     VkExtensionProperties khrExternalSemaphoreWin32         = vk::makeExtension(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
@@ -223,6 +239,9 @@ namespace dxvk {
     DxvkDeviceQueueIndex graphics;
     DxvkDeviceQueueIndex transfer;
     DxvkDeviceQueueIndex sparse;
+    DxvkDeviceQueueIndex blessedCompute; // blessed: async-compute, BLESSED_ASYNC=1 only
+    DxvkDeviceQueueIndex blessedVolCompute; // blessed: vol-async-3, BLESSED_VOL_ASYNC=2 only
+    DxvkDeviceQueueIndex blessedPresent; // blessed: present-idle, BLESSED_PRESENT=queue only
   };
 
 
@@ -430,6 +449,17 @@ namespace dxvk {
     void enableFeaturesAndExtensions();
 
     void enableQueues();
+
+    // blessed: async-compute -- fills m_queueMapping.blessedCompute, or
+    // leaves it ignored (and logs why). See blessed/blessed_async.cpp.
+    void blessedPickAsyncQueue();
+
+    // blessed: vol-async-3 -- fills m_queueMapping.blessedVolCompute
+    void blessedPickVolComputeQueue();
+
+    // blessed: present-idle -- fills m_queueMapping.blessedPresent with a
+    // spare graphics-family queue, or leaves it ignored. blessed/blessed_present.cpp
+    void blessedPickPresentQueue();
 
     void enableQueue(
             DxvkDeviceQueueIndex        queue);

@@ -1,0 +1,204 @@
+// blessed: BLESSED_SHADOW_SOFT pass 1/2 -- sun-disk ray tracing + temporal
+// accumulation. Writes (visibility, camera-relative position) into the
+// ping-pong accumulation image; blessed_soft_shadow_filter.comp reads it
+// back, blurs it, and writes the final visibility into the real shadow mask.
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// blessed: global sampler heap, fixed set/binding convention (see
+// dxvk_mipgen.comp, DxvkPipelineLayoutFlag::UsesSamplerHeap)
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+layout(set = 1, binding = 0)
+uniform texture2D s_depth;
+
+// blessed: last frame's accumulated (visibility, position) -- read with a
+// real bilinear sample at the reprojected uv, hence a real texture binding
+// rather than a storage image
+layout(set = 1, binding = 1)
+uniform texture2D s_history;
+
+// blessed: this frame's accumulated (visibility, position) -- becomes next
+// frame's s_history once the ping-pong indices swap host-side. Format
+// given explicitly (unlike the real shadow mask): this image is entirely
+// our own, so there's no need to lean on shaderStorageImageWriteWithoutFormat.
+layout(set = 1, binding = 2, rgba16f)
+uniform image2D s_accumOut;
+
+// blessed: per-dispatch camera/scene constants too big for the 128-byte
+// push constant budget (two mat4 alone are 128 bytes) -- see
+// BlessedSoftShadowConstants in blessed_soft_shadow.cpp, byte-for-byte.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer BlessedSoftShadowConstants {
+  mat4  invViewProj;       // CameraViewProjInverse, same convention as the hard-shadow pass
+  mat4  prevViewProj;      // the history's view-projection, same convention (see blessed_soft_shadow.cpp)
+  vec3  camDelta;          // tlas-frame shift (as the hard-shadow pass)
+  vec3  sunDir;            // unit vector toward the sun, world space
+  vec3  reprojDelta;       // this dispatch's camPosNow - the history's camPosNow
+  float farDepthValue;
+  float sunHalfAngleRad;
+  uint  spp;
+  uint  frameIndex;
+  uint  historyValid;      // 0 forces every pixel to reject history this dispatch
+};
+
+layout(push_constant, scalar) uniform BlessedSoftShadowPush {
+  uint64_t constantsAddress;
+  uint64_t tlasAddress;
+  uint64_t debugAddress;    // unused by this pass
+  uint     width;
+  uint     height;
+  uint     samplerIndex;
+  uint     tlasValid;
+  uint     debugMode;       // 0 off, 7 hist, 8 reproj (BLESSED_SHADOW_DEBUG)
+} pc;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// blessed: positions are stored scaled into fp16's range (max 65504), so
+// far terrain up to ~4.19M units still round-trips; fp16's relative
+// precision (2^-11) does not depend on the scale. All-zero = sky.
+const float POS_TO_ACCUM = 1.0 / 64.0;
+const float ACCUM_TO_POS = 64.0;
+
+// blessed: history is kept when the surface it stores lies within this
+// fraction of the camera distance of where this pixel's surface was.
+// A 3D test, unlike the old distance-only one: a pure camera turn keeps
+// every distance the same, so dragged history used to pass it.
+const float REJECT_REL = 0.01;
+
+// blessed: cheap per-pixel, per-frame hash -> [0,1). No texture, no state
+// carried between frames beyond the frame index folded into the seed, so a
+// static scene still gets a fresh dither pattern every frame.
+float Hash(uvec2 p, uint salt) {
+  uint h = p.x * 374761393u + p.y * 668265263u + salt * 2654435761u;
+  h = (h ^ (h >> 13u)) * 1274126177u;
+  h ^= h >> 16u;
+  return float(h) * (1.0 / 4294967296.0);
+}
+
+// blessed: uniform-solid-angle sample inside a cone of half-angle
+// acos(cosThetaMax), centered on `dir`
+vec3 SampleCone(vec3 dir, float cosThetaMax, vec2 xi) {
+  float cosTheta = mix(cosThetaMax, 1.0, xi.x);
+  float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+  float phi = 6.28318530718 * xi.y;
+
+  vec3 up = abs(dir.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+  vec3 tangent   = normalize(cross(up, dir));
+  vec3 bitangent = cross(dir, tangent);
+
+  return normalize(tangent * (cos(phi) * sinTheta) + bitangent * (sin(phi) * sinTheta) + dir * cosTheta);
+}
+
+void main() {
+  ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+  if (coord.x >= int(pc.width) || coord.y >= int(pc.height))
+    return;
+
+  BlessedSoftShadowConstants k = BlessedSoftShadowConstants(pc.constantsAddress);
+
+  float depth = texelFetch(sampler2D(s_depth, s_samplers[pc.samplerIndex]), coord, 0).r;
+
+  // sky, or no scene yet: fully lit, zero position so the filter pass
+  // never blurs across it and next frame never reprojects onto it (in the
+  // reproj debug view, 1.0 is also its "nothing to compare" code)
+  if (depth == k.farDepthValue || pc.tlasValid == 0u) {
+    imageStore(s_accumOut, coord, vec4(1.0, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  // d3d viewport conventions: uv in [0,1], ndc.x = 2u-1, ndc.y = 1-2v
+  vec2 uv = (vec2(coord) + 0.5) / vec2(pc.width, pc.height);
+  vec4 ndc = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+
+  // see blessed_sun_shadow.comp's comment: row-major cbuffer bytes read
+  // into a column-major glsl mat4 land transposed, so M*v is v*mat here
+  vec4 viewPosH = ndc * k.invViewProj;
+  vec3 camRelPos = viewPosH.xyz / viewPosH.w;
+
+  vec3 pTlas = camRelPos + k.camDelta;
+  float dist = length(camRelPos);
+  float tMin = 0.01 * dist + 1.0;
+
+  float cosThetaMax = cos(k.sunHalfAngleRad);
+  uint spp = max(k.spp, 1u);
+
+  uint lit = 0u;
+  for (uint i = 0u; i < spp; i++) {
+    vec2 xi = vec2(
+      Hash(uvec2(coord), k.frameIndex * 8u + i * 2u),
+      Hash(uvec2(coord) + uvec2(17u, 53u), k.frameIndex * 8u + i * 2u + 1u));
+    vec3 rayDir = SampleCone(k.sunDir, cosThetaMax, xi);
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, accelerationStructureEXT(pc.tlasAddress),
+      gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xFF,
+      pTlas, tMin, rayDir, 100000.0);
+    while (rayQueryProceedEXT(rq)) { }
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+      lit++;
+  }
+
+  float visRaw = float(lit) / float(spp);
+
+  // temporal reprojection: shift this frame's camera-relative position into
+  // the history's camera's frame of reference, then project with the
+  // history's view-projection
+  vec3 posPrev = camRelPos + k.reprojDelta;
+  float distPrev = length(posPrev);
+
+  vec4 clipPrev = vec4(posPrev, 1.0) * k.prevViewProj;
+  bool offscreen = clipPrev.w <= 0.0;
+
+  vec2 uvPrev = vec2(0.5);
+  if (!offscreen) {
+    vec3 ndcPrev = clipPrev.xyz / clipPrev.w;
+    uvPrev = vec2(ndcPrev.x * 0.5 + 0.5, (1.0 - ndcPrev.y) * 0.5);
+    offscreen = any(lessThan(uvPrev, vec2(0.0))) || any(greaterThan(uvPrev, vec2(1.0)));
+  }
+
+  vec4 hist = texture(sampler2D(s_history, s_samplers[pc.samplerIndex]), uvPrev);
+  vec3 histPos = hist.yzw * ACCUM_TO_POS;
+
+  // a bilinear tap that touches sky shrinks histPos toward zero, so it fails
+  // the 3D test below on its own; all four taps sky reads exactly zero
+  bool noHistory = offscreen || k.historyValid == 0u || dot(histPos, histPos) == 0.0;
+  float err = length(histPos - posPrev);
+  bool reject = noHistory || err > REJECT_REL * max(distPrev, 1.0);
+
+  vec4 posOut = vec4(0.0, camRelPos * POS_TO_ACCUM);
+
+  if (pc.debugMode == 7u) {
+    // BLESSED_SHADOW_DEBUG=hist: the filter pass just passes this straight
+    // through to the mask (1 = rejected, 0 = accepted)
+    imageStore(s_accumOut, coord, posOut + vec4(reject ? 1.0 : 0.0, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  if (pc.debugMode == 8u) {
+    // BLESSED_SHADOW_DEBUG=reproj: how far, in pixels, the history surface
+    // we sampled lies from this pixel's surface, measured before rejection.
+    // Mask byte = 16 * pixels (1/16 px steps, saturating at 254 = 15.9 px);
+    // 255 = nothing to compare (off last screen, sky, first dispatch).
+    // A correct reprojection reads ~0 everywhere but silhouettes and
+    // disocclusions, turning or not; a slide reads as the turn's speed.
+    vec2 uvRight = (vec2(coord) + vec2(1.5, 0.5)) / vec2(pc.width, pc.height);
+    vec4 rightH = vec4(uvRight.x * 2.0 - 1.0, 1.0 - uvRight.y * 2.0, depth, 1.0) * k.invViewProj;
+    float footprint = max(length(rightH.xyz / rightH.w - camRelPos), 1.0e-6);
+    float code = noHistory ? 255.0 : min(err / footprint * 16.0, 254.0);
+    imageStore(s_accumOut, coord, posOut + vec4(code / 255.0, 0.0, 0.0, 0.0));
+    return;
+  }
+
+  float blended = reject ? visRaw : mix(hist.x, visRaw, 0.1);
+
+  imageStore(s_accumOut, coord, posOut + vec4(blended, 0.0, 0.0, 0.0));
+}

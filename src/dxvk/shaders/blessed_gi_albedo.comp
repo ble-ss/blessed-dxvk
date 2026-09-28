@@ -1,0 +1,50 @@
+// blessed: gi v1 -- reads one diffuse texture's smallest mip (its average
+// colour) into the gi albedo table. One dispatch per newly-seen texture,
+// 1x1x1 workgroups: this only ever runs a handful of times total (once per
+// distinct texture the main lit pass draws), never per frame or per draw.
+#version 460
+
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// blessed: global sampler heap, same set/binding convention as
+// blessed_sun_shadow.comp (DxvkPipelineLayoutFlag::UsesSamplerHeap).
+layout(set = 0, binding = 0)
+uniform sampler s_samplers[];
+
+// blessed: this dispatch's one texture.
+layout(set = 1, binding = 0)
+uniform texture2D s_diffuse;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) buffer BlessedGiAlbedoBuffer {
+  vec4 rgb[]; // xyz = linear albedo, w unused
+};
+
+layout(push_constant, scalar) uniform BlessedGiAlbedoPushData {
+  BlessedGiAlbedoBuffer albedos;
+  uint                  samplerIndex;
+  uint                  albedoId;
+  // blessed: false when the SRV's own format is already srgb-typed (the
+  // sampler already linearized whatever textureLod below returns); true for
+  // a unorm-typed diffuse texture, decoded manually -- see blessed_gi.cpp.
+  uint                  needsSrgbDecode;
+} pc;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+  // blessed: the smallest mip (1x1, or as near as the chain gets) IS the
+  // texture's average colour -- exactly the "one flat albedo per texture"
+  // the brief asks for, with no extra reduction pass. Combined
+  // sampler2D(texture, sampler) is constructed inline at each use, never
+  // stored in a local -- glslang rejects a local variable of sampler type.
+  int lastLevel = max(textureQueryLevels(sampler2D(s_diffuse, s_samplers[pc.samplerIndex])) - 1, 0);
+  vec3 c = textureLod(sampler2D(s_diffuse, s_samplers[pc.samplerIndex]), vec2(0.5), float(lastLevel)).rgb;
+
+  if (pc.needsSrgbDecode != 0u)
+    c = pow(max(c, vec3(0.0)), vec3(2.2));
+
+  pc.albedos.rgb[pc.albedoId] = vec4(c, 1.0);
+}

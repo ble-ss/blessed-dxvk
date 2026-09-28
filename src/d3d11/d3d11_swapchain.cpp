@@ -1,11 +1,41 @@
+#include "blessed_autoinstance.h" // blessed: auto-instancing census
+#include "blessed_cascades.h" // blessed: sun shadow cascade learner + skip
+#include "blessed_cascade_cache.h" // blessed: cascade-cache
+#include "blessed_dump.h" // blessed: frame draw-classification dumper
+#include "blessed_gi.h" // blessed: ray-traced gi ambient patch
+#include "blessed_gpu_passes.h" // blessed: gpu-pass-timing
+#include "blessed_hook.h" // blessed: generic post-draw pixel-shader hook
+#include "blessed_point_shadow.h" // blessed: point-lights
+#include "blessed_vanilla_halfrate.h" // blessed: perf-halfrate
+#include "blessed_crash_log.h" // blessed: crash-log
+#include "blessed_skip_replaced.h" // blessed: gpu track step 2 -- skip vanilla work our features replace
+#include "blessed_volumetrics.h" // blessed: async-compute, the vol kick frame boundary
+#include "blessed_look.h" // blessed: look-post
+#include "blessed_halfrate.h" // blessed: half-rate far field
+#include "blessed_reflect_halfrate.h" // blessed: refl-harden
+#include "blessed_midframe_split.h" // blessed: between-passes, BLESSED_MIDFRAME_SPLIT
+#include "../dxvk/blessed/blessed_present.h" // blessed: present-idle, BLESSED_PRESENT=bridge
+#include "../dxvk/blessed/blessed_fse.h" // blessed: present-fse-appcontrolled, BLESSED_FSE=app
+#include "blessed_scene_capture.h" // blessed: scene-capture config + BLESSED_SCENE_LOG
+#include "blessed_threaded_context.h" // blessed: threaded-fe
+#include "blessed_zero_copy.h" // blessed: zero-copy-present
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 #include "d3d11_swapchain.h"
 
+#include "../util/util_likely.h"
+
 #include "../dxvk/dxvk_latency_builtin.h"
 #include "../dxvk/dxvk_shader_spirv.h"
 
+// blessed: rt selftest, fired once on the first present -- see blessed_rt.h
+#include "../dxvk/blessed/blessed_rt.h"
+#include "../dxvk/blessed/blessed_scene.h" // blessed: hook-cpu-2, BlessedSceneSkinBatch
+
 #include "../util/util_win32_compat.h"
+
+// blessed: render-thread timing probe, see src/util/util_blessed_probe.h
+#include "../util/util_blessed_probe.h"
 
 #include <d3d11_composition_vert.h>
 #include <d3d11_composition_frag.h>
@@ -82,6 +112,14 @@ namespace dxvk {
     // in DxvkDevice::~DxvkDevice.
     if (this_thread::isInModuleDetachment())
       return;
+
+    // blessed: threaded-fe-2 -- no recorded Present may outlive us
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device);
+
+    // blessed: zero-copy-present -- an early acquire must reach a present,
+    // or destroyResources waits for it forever
+    BlessedReleaseEarlyAcquire();
+    BlessedZeroCopy::OnSwapChainDestroyed(this);
 
     m_presenter->destroyResources();
     
@@ -180,6 +218,8 @@ namespace dxvk {
     const DXGI_SWAP_CHAIN_DESC1*    pDesc,
     const UINT*                     pNodeMasks,
           IUnknown* const*          ppPresentQueues) {
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe
+
     if (m_desc.Format != pDesc->Format)
       m_presenter->setSurfaceFormat(GetSurfaceFormat(pDesc->Format));
 
@@ -202,6 +242,7 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetGammaControl(
           UINT                      NumControlPoints,
     const DXGI_RGB*                 pControlPoints) {
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe-2
     bool isIdentity = true;
 
     if (NumControlPoints > 1) {
@@ -230,12 +271,15 @@ namespace dxvk {
     if (isIdentity)
       m_blitter->setGammaRamp(0, nullptr);
 
+    m_hasGammaRamp = !isIdentity; // blessed: zero-copy-present
+
     return S_OK;
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetFrameLatency(
           UINT                      MaxLatency) {
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe-2
     if (MaxLatency == 0 || MaxLatency > DXGI_MAX_SWAP_CHAIN_BUFFERS)
       return DXGI_ERROR_INVALID_CALL;
 
@@ -257,7 +301,31 @@ namespace dxvk {
           UINT                      SyncInterval,
           UINT                      PresentFlags,
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+    // blessed: threaded-fe -- stage 2 records Present for the front end,
+    // whose replay comes back through here and runs the body below.
+    // Stage 1 (and PRESENT_TEST) drains first and runs on the game
+    // thread. The census times the game-side call.
+    D3D11ThreadedContext* blessedFe = m_parent->BlessedFrontEnd();
+    bool blessedReplay = unlikely(blessedFe != nullptr) && D3D11ThreadedContext::IsReplaying();
+
+    if (unlikely(blessedFe != nullptr) && !blessedReplay
+     && blessedFe->RecordsPresent(PresentFlags, pPresentParameters))
+      return BlessedRecordPresent(blessedFe, SyncInterval, PresentFlags, pPresentParameters);
+
+    BlessedPresentScope blessedFePresent(blessedFe, blessedReplay);
+
+    // blessed: frame boundary for the render-thread probe, game side only
+    if (blessed::enabled() && !blessedReplay)
+      BlessedProbePresent(m_device.ptr());
+
     HRESULT hr = S_OK;
+
+    // blessed: one cached-pointer-guarded branch when disabled or already
+    // run; the selftest itself only ever fires once, gated on
+    // BLESSED_RT_SELFTEST=1.
+    BlessedRt* blessedRt = m_device->blessedRt();
+    if (unlikely(blessedRt != nullptr))
+      blessedRt->runSelfTestOnce();
 
     if (m_device->getDeviceStatus() != VK_SUCCESS)
       hr = DXGI_ERROR_DEVICE_RESET;
@@ -275,12 +343,67 @@ namespace dxvk {
       return hr;
     }
 
+    // blessed: scene-capture end-of-frame blas/tlas build. Injected as its
+    // own ordered cs chunk so it lands after every draw this frame already
+    // queued but still before PresentImage's own ExecuteFlush below --
+    // see blessed_scene.h's endFrame. One cached-bool branch when disabled.
+    if (unlikely(BlessedSceneCapture::IsEnabled())) {
+      BlessedSceneCapture::NotifySwapchainExtent(m_desc.Width, m_desc.Height);
+
+      // blessed: skin-v2 -- the depth-only pass before this frame's mask draw
+      uint32_t maskPass = BlessedSceneCapture::TakeMaskPass();
+
+      // blessed: hook-cpu-2 -- this frame's skinned draws travel with it
+      std::unique_ptr<BlessedSceneSkinBatch> skinBatch = BlessedSceneCapture::TakeSkinBatch();
+
+      m_parent->GetContext()->InjectCs(DxvkCsQueue::Ordered,
+        [maskPass, cSkinBatch = std::move(skinBatch)] (DxvkContext* ctx) mutable {
+          BlessedSceneCapture::EndFrameOnCs(); // blessed: scene-cs, static per-pass counts
+          ctx->blessedSceneEndFrame(maskPass, std::move(cSkinBatch));
+        });
+    }
+
+    // blessed: gi -- own copy of the swapchain extent (see blessed_gi.cpp's
+    // IsMainLitPassBound), refreshed every present regardless of scene
+    // capture's own enable state.
+    if (unlikely(BlessedGi::IsEnabled())) {
+      BlessedGi::NotifySwapchainExtent(m_desc.Width, m_desc.Height);
+
+      // blessed: probe trace, same ordered cs chunk as blessedSceneEndFrame
+      // and right after it, so this frame's scene tlas is already current
+      // when BlessedGiState::runTrace reads it (see blessed_gi.h). A cheap
+      // no-op (one pointer check) when BLESSED_GI=const rather than probes.
+      m_parent->GetContext()->InjectCs(DxvkCsQueue::Ordered,
+        [] (DxvkContext* ctx) {
+          ctx->blessedRunGiTrace();
+        });
+    }
+
+    // blessed: BLESSED_SKIP_CASCADES -- clears the learned cascade-image set
+    // on a resolution change. Cheap no-op otherwise.
+    if (unlikely(BlessedCascadeSkip::IsEnabled()))
+      BlessedCascadeSkip::NotifySwapchainExtent(m_desc.Width, m_desc.Height);
+
+    // blessed: cascade-cache -- ends a cascade still open, reads back
+    // verify counters, cascade_cache.jsonl windows
+    if (unlikely(BlessedCascadeCache::IsEnabled())) {
+      BlessedCascadeCache::NotifySwapchainExtent(m_desc.Width, m_desc.Height);
+      BlessedCascadeCache::OnPresent(m_parent->GetContext());
+    }
+
     try {
       hr = PresentImage(SyncInterval, pPresentParameters);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
       hr = E_FAIL;
     }
+
+    // blessed: gpu-pass-timing frame boundary: close, read back, write windows
+    if (unlikely(BlessedGpuPasses::IsEnabled()))
+      BlessedGpuPasses::OnPresent();
+    // blessed: between-passes -- resets the BLESSED_MIDFRAME_SPLIT pass counter
+    if (unlikely(BlessedMidframeSplit::IsEnabled()))
+      BlessedMidframeSplit::OnPresent();
 
     // Ensure to synchronize and release the frame latency semaphore
     // even if presentation failed with STATUS_OCCLUDED, or otherwise
@@ -293,11 +416,60 @@ namespace dxvk {
 
     if (hr == S_OK && m_latency) {
       latencyStats = m_latency->getStatistics(m_frameId);
-      m_latency->sleepAndBeginFrame(m_frameId + 1, std::abs(m_targetFrameRate));
+
+      // blessed: threaded-fe-2 -- a recorded Present sleeps game side
+      if (!blessedReplay)
+        m_latency->sleepAndBeginFrame(m_frameId + 1, std::abs(m_targetFrameRate));
     }
 
     if (m_latencyHud)
       m_latencyHud->accumulateStats(latencyStats);
+
+    // blessed: present-to-present frame boundary for the probe dumper
+    if (unlikely(BlessedDump::IsEnabled()) && hr == S_OK)
+      BlessedDump::OnPresent();
+
+    // blessed: present-to-present frame boundary for the post-draw hook's log
+    if (unlikely(BlessedHook::IsEnabled()) && hr == S_OK)
+      BlessedHook::OnPresent();
+    if (unlikely(BlessedLook::IsEnabled()) && hr == S_OK) // blessed: look-post
+      BlessedLook::OnPresent();
+    if (unlikely(BlessedHalfRate::IsAvailable())) // blessed: half-rate far field, the live switch
+      BlessedHalfRate::OnPresent();
+    if (unlikely(BlessedReflectHalfRate::IsEnabled())) // blessed: refl-harden
+      BlessedReflectHalfRate::OnPresent();
+    // blessed: gi.jsonl window boundary
+    if (unlikely(BlessedGi::IsEnabled()) && hr == S_OK)
+      BlessedGi::OnPresent(m_device.ptr());
+    // blessed: BLESSED_SCENE_LOG window boundary
+    if (unlikely(BlessedSceneCapture::IsEnabled()) && hr == S_OK)
+      BlessedSceneCapture::OnPresent(m_device.ptr());
+    // blessed: BLESSED_SKIP_CASCADES window boundary (cascades.jsonl)
+    if (unlikely(BlessedCascadeSkip::IsEnabled()) && hr == S_OK)
+      BlessedCascadeSkip::OnPresent();
+    // blessed: async-compute -- a volumetrics kick never outlives its frame
+    if (unlikely(BlessedVolumetrics::IsAsyncKickEnabled()))
+      BlessedVolumetrics::OnPresent();
+    // blessed: point-lights -- channel claims, learned maps, pointshadow.jsonl
+    if (unlikely(BlessedPointShadow::IsEnabled()) && hr == S_OK)
+      BlessedPointShadow::OnPresent();
+    BlessedCrashLogOnPresent(); // blessed: crash-log -- re-arm the unhandled-exception filter
+    // blessed: perf-halfrate -- per-frame skip state resets on every present
+    if (unlikely(BlessedVolHalfRate::IsEnabled()))
+      BlessedVolHalfRate::OnPresent();
+    // blessed: gpu track step 2 -- one jsonl window boundary per feature
+    if (hr == S_OK) {
+      if (unlikely(BlessedSkipAo::IsEnabled()))
+        BlessedSkipAo::OnPresent();
+      if (unlikely(BlessedSkipVolumetrics::IsDrawSkipEnabled() || BlessedSkipVolumetrics::IsDispatchSkipEnabled()))
+        BlessedSkipVolumetrics::OnPresent();
+      if (unlikely(BlessedSkipBloom::IsEnabled()))
+        BlessedSkipBloom::OnPresent();
+      if (unlikely(BlessedSkipShadowMask::IsEnabled()))
+        BlessedSkipShadowMask::OnPresent();
+      if (unlikely(BlessedAutoInstance::IsCensusEnabled())) // blessed: auto-instancing census
+        BlessedAutoInstance::OnPresent();
+    }
 
     return hr;
   }
@@ -318,6 +490,7 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetColorSpace(
           DXGI_COLOR_SPACE_TYPE     ColorSpace) {
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe-2
     VkColorSpaceKHR colorSpace = ConvertColorSpace(ColorSpace);
 
     if (!m_presenter->supportsColorSpace(colorSpace))
@@ -332,6 +505,7 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetHDRMetaData(
     const DXGI_VK_HDR_METADATA*     pMetaData) {
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe-2
     // For some reason this call always seems to succeed on Windows
     if (pMetaData->Type == DXGI_HDR_METADATA_TYPE_HDR10)
       m_presenter->setHdrMetadata(ConvertHDRMetadata(pMetaData->HDR10));
@@ -355,6 +529,7 @@ namespace dxvk {
 
   void STDMETHODCALLTYPE D3D11SwapChain::SetTargetFrameRate(
           double                    FrameRate) {
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe-2
     m_targetFrameRate = FrameRate;
 
     if (m_presenter != nullptr)
@@ -364,6 +539,7 @@ namespace dxvk {
 
   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetBackgroundColor(
     const DXGI_RGBA*                pColor) {
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe-2
     m_clearColor.float32[0] = pColor->r;
     m_clearColor.float32[1] = pColor->g;
     m_clearColor.float32[2] = pColor->b;
@@ -403,6 +579,175 @@ namespace dxvk {
   }
 
 
+  Rc<DxvkImage> D3D11SwapChain::BlessedTryEarlyAcquire(D3D11ImmediateContext* ctx) {
+    // blessed: zero-copy-present, see blessed_zero_copy.h. Shape checks
+    // first: anything that needs the blitter (HUD, colour space, gamma,
+    // MSAA, more than one D3D back buffer, incremental present) or that a
+    // redirect cannot undo keeps the normal path for the frame.
+    if (m_zcAcquired || m_zcMismatch)
+      return nullptr; // never acquire twice without a present in between
+
+    if (m_hasHud || m_backBuffers.size() != 1u || m_compositionBuffer != nullptr)
+      return nullptr;
+
+    if (m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL
+     || m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL)
+      return nullptr;
+
+    if (m_colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR || m_hasGammaRamp)
+      return nullptr;
+
+    Rc<DxvkImage> backBufferImage = GetCommonTexture(m_backBuffers[0].ptr())->GetImage();
+
+    if (backBufferImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      return nullptr;
+
+    // blessed: zero-copy-present, present-mode fix -- the presenter creates
+    // its swap chain at the first acquire, in the mode of the interval it
+    // was last given (default 1, fifo). Before any real Present that is
+    // not the game's interval, and with dynamic present modes a later
+    // setSyncInterval never recreates it, so frame 1 takes the normal
+    // path: its acquire runs in PresentImage after setSyncInterval. After
+    // that, reapply the last real interval so a recreated swap chain
+    // (resize, out of date) uses it too; a no-op when unchanged.
+    if (!m_blessedSyncIntervalKnown)
+      return nullptr;
+
+    m_presenter->setSyncInterval(m_blessedSyncInterval);
+
+    // Submit everything recorded so far with no WSI semaphore attached, so
+    // the gpu starts on it while this thread may block in the acquire.
+    ctx->ExecuteFlush(GpuFlushType::ImplicitStrongHint, nullptr, false);
+
+    PresenterSync sync;
+    Rc<DxvkImage> swapImage;
+
+    VkResult status = m_presenter->acquireNextImage(sync, swapImage);
+
+    // VK_NOT_READY (occluded, no swap chain) and errors hold no image;
+    // VK_SUCCESS and VK_SUBOPTIMAL_KHR do, and must reach a present.
+    if (status < 0 || status == VK_NOT_READY)
+      return nullptr;
+
+    m_zcSync = sync;
+    m_zcImage = swapImage;
+    m_zcAcquired = true;
+    m_zcWaitEmitted = false;
+
+    VkRect2D srcRect = ComputeSrcPresentRect();
+    VkExtent2D dstSize = { swapImage->info().extent.width, swapImage->info().extent.height };
+    VkRect2D dstRect = ComputeDstPresentRect(dstSize, srcRect.extent);
+
+    bool exactFit = srcRect.offset.x == 0 && srcRect.offset.y == 0
+                 && dstRect.offset.x == 0 && dstRect.offset.y == 0
+                 && dstRect.extent.width  == srcRect.extent.width
+                 && dstRect.extent.height == srcRect.extent.height
+                 && dstSize.width  == backBufferImage->info().extent.width
+                 && dstSize.height == backBufferImage->info().extent.height;
+
+    // The presenter exposes the swap image as the sRGB half of its format
+    // pair when the swap chain is mutable; the back buffer's RTV format is
+    // checked per view in BlessedZeroCopy::RedirectRenderTarget.
+    VkFormat swapFormat = vk::getSrgbFormatPair(swapImage->info().format).first;
+    VkFormat backFormat = vk::getSrgbFormatPair(backBufferImage->info().format).first;
+
+    bool formatMatch = swapImage->info().format == backBufferImage->info().format
+                    || (swapFormat != VK_FORMAT_UNDEFINED && swapFormat == backFormat);
+
+    // The fallback copies the acquired image back into the back buffer.
+    VkImageUsageFlags needUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    bool usageMatch = (swapImage->info().usage & needUsage) == needUsage
+                   && (backBufferImage->info().usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+
+    if (!exactFit || !formatMatch || !usageMatch) {
+      // Stays so until the back buffers or the swap chain shape change;
+      // PresentImage presents the held image through the normal blit.
+      m_zcMismatch = true;
+
+      Logger::warn(str::format("BlessedZeroCopy: swap image does not fit the back buffer (fit ",
+        exactFit ? 1 : 0, ", format ", formatMatch ? 1 : 0, ", usage ", usageMatch ? 1 : 0,
+        "; ", swapImage->info().format, " vs ", backBufferImage->info().format,
+        "), using the present blit until the next resize"));
+      return nullptr;
+    }
+
+    // Only the command list that starts here waits for the acquire; the
+    // present semaphore is attached by PresentImage as usual.
+    PresenterSync acquireOnly = { };
+    acquireOnly.acquire = sync.acquire;
+
+    ctx->EmitCs([cSync = acquireOnly] (DxvkContext* dxvkCtx) {
+      dxvkCtx->synchronizeWsi(cSync);
+    });
+
+    m_zcWaitEmitted = true;
+    return swapImage;
+  }
+
+
+  void D3D11SwapChain::BlessedCorrectBackBufferForRead(
+          D3D11ImmediateContext*  ctx,
+    const Rc<DxvkImage>&          swapImage) {
+    // blessed: zero-copy-present -- a fallback while the back buffer's
+    // writes were going into the acquired swap image: copy them back
+    // (formats are an sRGB pair or equal, so the copy is bitwise).
+    Rc<DxvkImage> backBufferImage = GetCommonTexture(m_backBuffers[0].ptr())->GetImage();
+
+    ctx->EmitCs([
+      cDst    = backBufferImage,
+      cSrc    = swapImage,
+      cExtent = backBufferImage->info().extent
+    ] (DxvkContext* dxvkCtx) {
+      VkImageSubresourceLayers layers = { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+
+      dxvkCtx->copyImage(
+        cDst, layers, VkOffset3D { 0, 0, 0 },
+        cSrc, layers, VkOffset3D { 0, 0, 0 },
+        cExtent);
+    });
+  }
+
+
+  void D3D11SwapChain::BlessedReleaseEarlyAcquire() {
+    // blessed: zero-copy-present -- an early acquire with no Present to
+    // follow (the swap chain is going away). The presenter will not
+    // acquire or tear down while an image is held, so present it as is.
+    if (!m_zcAcquired)
+      return;
+
+    PresenterSync sync = m_zcSync;
+
+    if (m_zcWaitEmitted)
+      sync.acquire = VK_NULL_HANDLE;
+
+    m_zcAcquired = false;
+    m_zcWaitEmitted = false;
+    m_zcImage = nullptr;
+    BlessedZeroCopy::OnPresent();
+
+    auto immediateContext = m_parent->GetContext();
+    auto immediateContextLock = immediateContext->LockContext();
+
+    immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+
+    immediateContext->EmitCs([
+      cDevice    = m_device,
+      cPresenter = m_presenter,
+      cSync      = sync,
+      cFrameId   = ++m_frameId
+    ] (DxvkContext* ctx) {
+      ctx->synchronizeWsi(cSync);
+      ctx->flushCommandList(nullptr, nullptr);
+
+      cDevice->presentImage(cPresenter, nullptr, cFrameId, 0u, nullptr, nullptr);
+    });
+
+    immediateContext->FlushCsChunk();
+  }
+
+
   HRESULT D3D11SwapChain::PresentImage(
             UINT                      SyncInterval,
       const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
@@ -410,8 +755,26 @@ namespace dxvk {
     auto immediateContext = m_parent->GetContext();
     auto immediateContextLock = immediateContext->LockContext();
 
+    // blessed: gpu-pass-timing, the end of the frame's last pass, before
+    // the flush so it lands in the frame's own command list
+    if (unlikely(BlessedGpuPasses::IsEnabled())) {
+      BlessedGpuPassMark mark = BlessedGpuPasses::OnFrameEnd(m_device.ptr());
+
+      if (mark.query != nullptr) {
+        immediateContext->EmitCs([cMark = std::move(mark)] (DxvkContext* ctx) {
+          BlessedGpuPasses::WriteMark(ctx, cMark);
+        });
+      }
+    }
+
     immediateContext->EndFrame(m_latency);
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+
+    // blessed: zero-copy-present, present-mode fix -- remember the interval
+    // this real Present configured so the next frame's early acquire (if
+    // any) applies the same one before it runs, see BlessedTryEarlyAcquire.
+    m_blessedSyncIntervalKnown = true;
+    m_blessedSyncInterval = SyncInterval;
 
     m_presenter->setSyncInterval(SyncInterval);
 
@@ -422,16 +785,44 @@ namespace dxvk {
     PresenterSync sync;
     Rc<DxvkImage> backBuffer;
 
-    VkResult status = m_presenter->acquireNextImage(sync, backBuffer);
+    // blessed: zero-copy-present -- BlessedTryEarlyAcquire may already hold
+    // this frame's image (redirected or not). Reuse it: acquireNextImage
+    // blocks until the held image is presented. If the acquire semaphore
+    // was already attached to an earlier command list, drop it here: a
+    // binary semaphore is waited on exactly once.
+    bool blessedHeld = m_zcAcquired;
+    bool blessedSkipBlit = false;
 
-    if (status != VK_SUCCESS && m_latency)
-      m_latency->discardTimings();
+    if (unlikely(blessedHeld)) {
+      sync = m_zcSync;
+      backBuffer = m_zcImage;
 
-    if (status < 0)
-      return E_FAIL;
+      if (m_zcWaitEmitted)
+        sync.acquire = VK_NULL_HANDLE;
 
-    if (status == VK_NOT_READY)
-      return DXGI_STATUS_OCCLUDED;
+      blessedSkipBlit = BlessedZeroCopy::IsRedirectActive();
+
+      m_zcAcquired = false;
+      m_zcWaitEmitted = false;
+      m_zcImage = nullptr;
+    }
+
+    // per-frame redirect state resets whether or not this present succeeds
+    if (unlikely(BlessedZeroCopy::IsEnabled()))
+      BlessedZeroCopy::OnPresent();
+
+    if (likely(!blessedHeld)) {
+      VkResult status = m_presenter->acquireNextImage(sync, backBuffer);
+
+      if (status != VK_SUCCESS && m_latency)
+        m_latency->discardTimings();
+
+      if (status < 0)
+        return E_FAIL;
+
+      if (status == VK_NOT_READY)
+        return DXGI_STATUS_OCCLUDED;
+    }
 
     VkExtent2D dstSize = { backBuffer->info().extent.width, backBuffer->info().extent.height };
 
@@ -499,22 +890,35 @@ namespace dxvk {
       cDirtyRects     = std::move(dirtyRects),
       cClearColor     = m_clearColor,
       cSrcRect        = srcRect,
-      cDstRect        = dstRect
+      cDstRect        = dstRect,
+      cBlessedMark    = BlessedGpuPasses::IsEnabled() && !blessedSkipBlit // blessed: gpu-pass-timing, no mark without a blit
+        ? BlessedGpuPasses::OnPresentBlit(m_device.ptr()) : BlessedGpuPassMark(),
+      cSkipBlit       = blessedSkipBlit // blessed: zero-copy-present
     ] (DxvkContext* ctx) {
-      // Update back buffer color space as necessary
-      if (cSwapImage->image()->info().colorSpace != cColorSpace) {
-        DxvkImageUsageInfo usage = { };
-        usage.colorSpace = cColorSpace;
+      // blessed: zero-copy-present -- the frame's back-buffer render
+      // targets were already redirected straight into cBackBuffer (the
+      // acquired swap chain image) at bind time, and nothing read the
+      // back buffer since, so there is nothing left to blit.
+      if (!cSkipBlit) {
+        // Update back buffer color space as necessary
+        if (cSwapImage->image()->info().colorSpace != cColorSpace) {
+          DxvkImageUsageInfo usage = { };
+          usage.colorSpace = cColorSpace;
 
-        ctx->ensureImageCompatibility(cSwapImage->image(), usage);
+          ctx->ensureImageCompatibility(cSwapImage->image(), usage);
+        }
+
+        // Blit the D3D back buffer onto the actual Vulkan
+        // swap chain and render the HUD if we have one.
+        auto contextObjects = ctx->beginExternalRendering();
+
+        cBlitter->present(contextObjects, cClearColor,
+          cBackBuffer, cDstRect, cSwapImage, cSrcRect);
+
+        // blessed: gpu-pass-timing, the end of dxvk's own present blit
+        if (unlikely(cBlessedMark.query != nullptr))
+          BlessedGpuPasses::WriteMark(ctx, cBlessedMark);
       }
-
-      // Blit the D3D back buffer onto the actual Vulkan
-      // swap chain and render the HUD if we have one.
-      auto contextObjects = ctx->beginExternalRendering();
-
-      cBlitter->present(contextObjects, cClearColor,
-        cBackBuffer, cDstRect, cSwapImage, cSrcRect);
 
       // Submit current command list and present
       ctx->synchronizeWsi(cSync);
@@ -588,6 +992,23 @@ namespace dxvk {
         cAdapter->vki()->instance(),
         cAdapter->handle(), surface);
     });
+
+    // blessed: present-idle -- BLESSED_PRESENT=bridge presents through our own dxgi swap chain
+    if (unlikely(BlessedPresent::Mode() == BlessedPresentMode::Bridge)) {
+      Com<IBlessedDXGIVkWindow> window;
+
+      if (SUCCEEDED(m_surfaceFactory->QueryInterface(__uuidof(IBlessedDXGIVkWindow), reinterpret_cast<void**>(&window))))
+        m_presenter->blessedUseBridge(window->GetWindow());
+    }
+
+    // blessed: present-fse-appcontrolled -- BLESSED_FSE=app requests exclusive fullscreen
+    // on the app's own window, application-controlled instead of driver-managed
+    if (unlikely(BlessedFse::Mode() == BlessedFseMode::App)) {
+      Com<IBlessedDXGIVkWindow> window;
+
+      if (SUCCEEDED(m_surfaceFactory->QueryInterface(__uuidof(IBlessedDXGIVkWindow), reinterpret_cast<void**>(&window))))
+        m_presenter->blessedRequestAppControlledFse(window->GetWindow());
+    }
 
     m_presenter->setSurfaceFormat(GetSurfaceFormat(m_desc.Format));
     m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
@@ -667,6 +1088,25 @@ namespace dxvk {
         ctx->initImage(cImages[i], VK_IMAGE_LAYOUT_UNDEFINED);
       }
     });
+
+    // blessed: zero-copy-present -- track this back buffer so render-target
+    // binds can be redirected. Ineligible (null) with more than one D3D back
+    // buffer (sequential, incremental present), or when the back buffer can
+    // be written or read outside the hooked paths (UAV, GDI).
+    m_zcMismatch = false;
+
+    if (BlessedZeroCopy::IsEnabled()) {
+      bool eligible = backBufferCount == 1u
+        && !(m_desc.BufferUsage & DXGI_USAGE_UNORDERED_ACCESS)
+        && !(m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE);
+
+      Rc<DxvkImage> trackedImage = eligible
+        ? GetCommonTexture(m_backBuffers[0].ptr())->GetImage()
+        : nullptr;
+
+      BlessedZeroCopy::SetTrackedSwapChain(this,
+        static_cast<ID3D11Resource*>(m_backBuffers[0].ptr()), trackedImage);
+    }
   }
 
 
@@ -693,6 +1133,7 @@ namespace dxvk {
   void D3D11SwapChain::DestroyLatencyTracker() {
     // Need to make sure the context stops using
     // the tracker for submissions
+    m_parent->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe
     m_parent->GetContext()->InjectCs(DxvkCsQueue::Ordered, [
       cLatency = m_latency
     ] (DxvkContext* ctx) {
@@ -706,7 +1147,13 @@ namespace dxvk {
 
   void D3D11SwapChain::SyncFrameLatency() {
     // Wait for the sync event so that we respect the maximum frame latency
-    m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
+    // blessed: threaded-fe-2 -- one frame less on the front end: the game
+    // may record one Present ahead of it, so the depth in flight is kept
+    D3D11ThreadedContext* blessedFe = m_parent->BlessedFrontEnd();
+    uint64_t blessedAhead = unlikely(blessedFe != nullptr) && blessedFe->RunsAhead()
+      && D3D11ThreadedContext::IsReplaying() ? 1u : 0u;
+
+    m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency() + blessedAhead);
 
     m_frameLatencySignal->setCallback(m_frameId, [this,
       cFrameId           = m_frameId,

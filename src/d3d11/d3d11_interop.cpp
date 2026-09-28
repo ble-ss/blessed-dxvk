@@ -75,6 +75,7 @@ namespace dxvk {
     const VkImageSubresourceRange*  pSubresources,
           VkImageLayout             OldLayout,
           VkImageLayout             NewLayout) {
+    m_device->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe
     auto immediateContext = m_device->GetContext();
 
     immediateContext->TransitionSurfaceLayout(
@@ -83,6 +84,7 @@ namespace dxvk {
   
   
   void STDMETHODCALLTYPE D3D11VkInterop::FlushRenderingCommands() {
+    m_device->BlessedDrainFrontEnd(blessed::FeDrain::Device); // blessed: threaded-fe
     auto immediateContext = m_device->GetContext();
     immediateContext->Flush();
     immediateContext->SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
