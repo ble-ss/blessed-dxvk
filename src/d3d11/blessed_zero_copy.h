@@ -1,7 +1,6 @@
 // blessed: BLESSED_ZERO_COPY -- redirect the frame's back-buffer render-target writes into the acquired swap chain image and skip the present blit
 //
-// See .briefs/zero-copy-present.md and docs/research/audit-{astra,fable}-
-// 2026-09-27-round5.md ("the present blit can go").
+// worth about +0.73% in the traversal (c67), roughly the 0.03 ms the blit took.
 //
 // mechanism: the first time a frame binds (or clears) the tracked back
 // buffer as a render target, D3D11SwapChain::BlessedTryEarlyAcquire flushes

@@ -150,7 +150,7 @@ namespace dxvk {
 
     // blessed: gi-bounds -- origin (default) keeps the 13-float stride and
     // every sample exactly as before
-    m_sampleBounds = env::getEnvVar("BLESSED_GI_SAMPLE") != "origin"; // blessed: bounds is the default (rori, 2026-09-23)
+    m_sampleBounds = env::getEnvVar("BLESSED_GI_SAMPLE") != "origin"; // blessed: bounds is the default (2026-09-23)
 
     if (m_sampleBounds) {
       m_probeStride = ProbeStride + 1u;

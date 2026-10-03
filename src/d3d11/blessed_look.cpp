@@ -24,8 +24,8 @@
 // blessed: env, with defaults (profile bless unless noted)
 //
 //   BLESSED_LOOK=bless                 on; anything else is off
-//   BLESSED_LOOK_PROFILE=bless|rori    rori: bloom strength 0.65, haze 0.22,
-//                                      threshold 0.73 (her R_EDIT bloom), same grade
+//   BLESSED_LOOK_PROFILE=bless|edit    edit: bloom strength 0.65, haze 0.22,
+//                                      threshold 0.73 (an r_edit bloom), same grade
 //   BLESSED_LOOK_PS_TONEMAP=716590ec   pass 175, ISHDR blend
 //   BLESSED_LOOK_PS_FINAL=831de5eb     pass 181, final copy
 //   BLESSED_LOOK_FINAL_MATCH=0         which match of the final ps per frame to run after
@@ -220,18 +220,17 @@ namespace dxvk {
 
       c.profile = env::getEnvVar("BLESSED_LOOK_PROFILE");
       if (c.profile.empty())
-        c.profile = "blessed"; // blessed: rori picked the blend as the default (2026-09-23)
+        c.profile = "blessed"; // blessed: the blend is the default (2026-09-23)
 
-      // blessed: bless = the shipped default-config.json; rori = her R_EDIT
-      // bloom (rmls-irl.settings.txt, 2026-09-09) with bless's grade
-      if (c.profile == "rori") {
+      // blessed: bless = the shipped default-config.json; edit = an r_edit
+      // bloom with bless's grade
+      if (c.profile == "edit") {
         p.bloomStrength  = 0.65f;
         a.bloomHaze      = 0.22f;
         a.bloomThreshold = 0.73f;
       } else if (c.profile == "blessed") {
-        // blessed: rori 2026-09-23, "go with bless but move some of rori into
-        // it": bless's grade, the bloom halfway to her r_edit, her grain and
-        // exposure, and less haze than either (skyrim's daylight is already
+        // blessed: the blend (2026-09-23): bless's grade, the bloom halfway to
+        // the r_edit, its grain and exposure, and less haze than either (skyrim's daylight is already
         // hazy; bless's 0.10 read milky on it, look-bless-1)
         p.bloomStrength  = 0.48f;
         a.bloomHaze      = 0.07f;

@@ -1,6 +1,6 @@
 # blessed-dxvk
 
-This is a fork of DXVK 3.1.1, tuned for one game: Skyrim Special Edition on Windows. With the benchmark harness and SKSE plugin from **[blessed-skyrim](https://github.com/ble-ss/blessed-skyrim)**, it runs Skyrim faster than native DX11 at ultra 1080p: +10.97% in Whiterun and +4.37% flying the plains (paired campaigns, 5 of 5 runs), and 1.52x stock DXVK in Whiterun.
+This is a fork of DXVK 3.1.1, tuned for one game: Skyrim Special Edition on Windows. With the SKSE plugin from **[blessed-skyrim](https://github.com/ble-ss/blessed-skyrim)**, it runs Skyrim faster than native DX11 at ultra 1080p: +10.97% in Whiterun and +4.37% flying the plains (paired campaigns, 5 of 5 runs), and 1.52x stock DXVK in Whiterun.
 
 The work is on the `blessed` branch, as changes on top of the 3.1.1 release:
 
